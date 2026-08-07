@@ -16,8 +16,10 @@ P123DiskMulti STRM 助手模块（多盘）
 
 import ast
 import threading
+import weakref
+from datetime import datetime
 from pathlib import Path, PurePosixPath
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Callable, Dict, Iterable, List, Optional, Tuple
 from urllib.parse import quote
 
 from p123client import check_response
@@ -66,6 +68,12 @@ class StrmHelper:
         )
         # 全量同步防重入锁
         self._sync_lock = threading.Lock()
+        # 后台同步状态（start_full_sync 更新，sync_status 读取）
+        self._sync_running = False
+        self._sync_last_result: Optional[Dict] = None
+        self._sync_last_time: Optional[str] = None
+        # 后台同步完成回调（弱引用，避免与插件类循环引用）
+        self._on_done_ref = None
 
     # ==================== URL 构建与换取 ====================
 
@@ -191,74 +199,163 @@ class StrmHelper:
         self, paths_text: str, overwrite: bool = False
     ) -> Dict:
         """
-        全量扫描配置的网盘目录并生成 STRM 文件
+        全量扫描配置的网盘目录并生成 STRM 文件（同步执行）
+
+        与后台同步共用防重入锁：已有任务在运行时直接返回失败统计。
 
         :param paths_text: 路径映射配置，每行「本地STRM目录#网盘媒体库目录」
         :param overwrite: True 覆盖已存在的 STRM 文件
         :return: 统计结果 {"ok": n, "skip": n, "fail": n, "errors": [...], "paths": [...]}
+        """
+        if not self._sync_lock.acquire(blocking=False):
+            return {
+                "ok": 0,
+                "skip": 0,
+                "fail": 0,
+                "errors": ["已有全量同步任务正在进行，请稍后再试"],
+                "paths": [],
+            }
+        try:
+            return self._full_sync_unlocked(paths_text, overwrite)
+        finally:
+            self._sync_lock.release()
+
+    def _full_sync_unlocked(
+        self, paths_text: str, overwrite: bool = False
+    ) -> Dict:
+        """
+        全量同步核心实现（调用方须持有 _sync_lock）
         """
         result: Dict = {"ok": 0, "skip": 0, "fail": 0, "errors": [], "paths": []}
         mappings = self.parse_mappings(paths_text)
         if not mappings:
             result["errors"].append("未配置全量同步目录")
             return result
+        for local_dir, pan_dir in mappings:
+            root = self._api.get_item(Path(pan_dir))
+            if not root or root.type != "dir":
+                result["fail"] += 1
+                result["errors"].append(f"网盘目录不存在或不可访问: {pan_dir}")
+                continue
+            logger.info(f"【123多盘STRM】开始全量同步: {pan_dir} -> {local_dir}")
+            try:
+                for item in self._walk_files(root):
+                    if not self.is_media_file(item.name):
+                        continue
+                    rel_path = self._relative_path(item.path, pan_dir)
+                    if not rel_path:
+                        continue
+                    strm_path = (
+                        Path(local_dir)
+                        / rel_path.parent
+                        / (rel_path.stem + ".strm")
+                    )
+                    if strm_path.exists() and not overwrite:
+                        result["skip"] += 1
+                        continue
+                    info = self._extract_file_info(item)
+                    if not info:
+                        result["fail"] += 1
+                        result["errors"].append(f"文件信息缺失: {item.path}")
+                        continue
+                    url = self.build_strm_url(
+                        name=info["name"],
+                        size=info["size"],
+                        md5=info["md5"],
+                        s3_key_flag=info["s3_key_flag"],
+                        disk_name=self._disk_of(item.path),
+                    )
+                    if not url:
+                        result["fail"] += 1
+                        break
+                    if self._write_strm(strm_path, url):
+                        result["ok"] += 1
+                        result["paths"].append(str(strm_path))
+                    else:
+                        result["fail"] += 1
+                        result["errors"].append(f"写入失败: {strm_path}")
+            except Exception as e:
+                result["fail"] += 1
+                result["errors"].append(f"同步 {pan_dir} 失败: {e}")
+        logger.info(
+            f"【123多盘STRM】全量同步完成: 生成 {result['ok']} 个，"
+            f"跳过 {result['skip']} 个，失败 {result['fail']} 个"
+        )
+        return result
+
+    def start_full_sync(
+        self,
+        paths_text: str,
+        overwrite: bool = False,
+        on_done: Optional[Callable[[Dict], None]] = None,
+    ) -> bool:
+        """
+        后台异步全量同步：立即返回，同步在守护线程中默默执行
+
+        :param paths_text: 路径映射配置
+        :param overwrite: True 覆盖已存在的 STRM 文件
+        :param on_done: 同步完成后回调（参数为结果 dict），在后台线程中调用
+        :return: True 已启动后台同步；False 已有同步任务在运行
+        """
         if not self._sync_lock.acquire(blocking=False):
-            result["errors"].append("已有全量同步任务正在进行，请稍后再试")
-            return result
+            return False
+        if on_done is not None:
+            # 绑定方法用 WeakMethod，普通函数/静态方法用 weakref.ref
+            if hasattr(on_done, "__self__"):
+                self._on_done_ref = weakref.WeakMethod(on_done)
+            else:
+                self._on_done_ref = weakref.ref(on_done)
+        else:
+            self._on_done_ref = None
+        threading.Thread(
+            target=self._sync_worker,
+            args=(paths_text, overwrite),
+            daemon=True,
+            name="P123MultiStrmSync",
+        ).start()
+        return True
+
+    def _sync_worker(self, paths_text: str, overwrite: bool):
+        """
+        后台同步工作线程（持有 _sync_lock）
+        """
+        self._sync_running = True
+        self._sync_last_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         try:
-            for local_dir, pan_dir in mappings:
-                root = self._api.get_item(Path(pan_dir))
-                if not root or root.type != "dir":
-                    result["fail"] += 1
-                    result["errors"].append(f"网盘目录不存在或不可访问: {pan_dir}")
-                    continue
-                logger.info(f"【123多盘STRM】开始全量同步: {pan_dir} -> {local_dir}")
+            result = self._full_sync_unlocked(paths_text, overwrite)
+            self._sync_last_result = result
+            # 完成后回调（弱引用回调可能已被回收）
+            cb = self._on_done_ref() if self._on_done_ref else None
+            if cb:
                 try:
-                    for item in self._walk_files(root):
-                        if not self.is_media_file(item.name):
-                            continue
-                        rel_path = self._relative_path(item.path, pan_dir)
-                        if not rel_path:
-                            continue
-                        strm_path = (
-                            Path(local_dir)
-                            / rel_path.parent
-                            / (rel_path.stem + ".strm")
-                        )
-                        if strm_path.exists() and not overwrite:
-                            result["skip"] += 1
-                            continue
-                        info = self._extract_file_info(item)
-                        if not info:
-                            result["fail"] += 1
-                            result["errors"].append(f"文件信息缺失: {item.path}")
-                            continue
-                        url = self.build_strm_url(
-                            name=info["name"],
-                            size=info["size"],
-                            md5=info["md5"],
-                            s3_key_flag=info["s3_key_flag"],
-                            disk_name=self._disk_of(item.path),
-                        )
-                        if not url:
-                            result["fail"] += 1
-                            break
-                        if self._write_strm(strm_path, url):
-                            result["ok"] += 1
-                            result["paths"].append(str(strm_path))
-                        else:
-                            result["fail"] += 1
-                            result["errors"].append(f"写入失败: {strm_path}")
+                    cb(result)
                 except Exception as e:
-                    result["fail"] += 1
-                    result["errors"].append(f"同步 {pan_dir} 失败: {e}")
-            logger.info(
-                f"【123多盘STRM】全量同步完成: 生成 {result['ok']} 个，"
-                f"跳过 {result['skip']} 个，失败 {result['fail']} 个"
-            )
-            return result
+                    logger.warn(f"【123多盘STRM】同步完成回调执行失败: {e}")
+        except Exception as e:
+            self._sync_last_result = {
+                "ok": 0,
+                "skip": 0,
+                "fail": 1,
+                "errors": [f"后台同步异常: {e}"],
+                "paths": [],
+            }
+            logger.error(f"【123多盘STRM】后台同步异常: {e}")
         finally:
+            self._sync_running = False
             self._sync_lock.release()
+
+    def sync_status(self) -> Dict:
+        """
+        后台同步状态快照
+
+        :return: {"running": bool, "last_time": str|None,
+                  "last_result": dict|None}
+        """
+        return {
+            "running": self._sync_running,
+            "last_time": self._sync_last_time,
+            "last_result": self._sync_last_result,
+        }
 
     def _walk_files(self, dir_item: FileItem) -> Iterable[FileItem]:
         """

@@ -40,7 +40,7 @@ class P123DiskMulti(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/DDSRem-Dev/MoviePilot-Plugins/main/icons/P123Disk.png"
     # 插件版本
-    plugin_version = "1.1.0"
+    plugin_version = "1.2.0"
     # 插件作者
     plugin_author = "Rst307"
     # 作者主页
@@ -163,19 +163,17 @@ class P123DiskMulti(_PluginBase):
 
     def _scheduled_strm_sync(self):
         """
-        定时全量同步 STRM
+        定时全量同步 STRM（后台执行，不与手动同步并发）
         """
         if not self._strm:
             return
-        try:
-            result = self._strm.full_sync(
-                self._full_sync_paths or "",
-                overwrite=self._full_sync_overwrite,
-            )
-            if result.get("paths") and self._refresh_mediaserver:
-                self._refresh_emby(result["paths"])
-        except Exception as e:
-            logger.error(f"【123多盘】定时全量同步 STRM 失败: {e}")
+        started = self._strm.start_full_sync(
+            self._full_sync_paths or "",
+            overwrite=self._full_sync_overwrite,
+            on_done=self._strm_sync_done,
+        )
+        if not started:
+            logger.info("【123多盘】定时同步触发时已有同步任务在运行，跳过本次")
 
     @staticmethod
     def _parse_disks(config: dict) -> List[DiskAccount]:
@@ -308,8 +306,16 @@ class P123DiskMulti(_PluginBase):
                 "endpoint": self.api_strm_sync,
                 "auth": "bear",
                 "methods": ["POST"],
-                "summary": "全量同步生成STRM",
-                "description": "扫描所有网盘的媒体目录，批量生成 STRM 文件到本地",
+                "summary": "全量同步生成STRM（后台）",
+                "description": "后台扫描所有网盘的媒体目录并生成 STRM 文件，立即返回",
+            },
+            {
+                "path": "/strm_status",
+                "endpoint": self.api_strm_status,
+                "auth": "bear",
+                "methods": ["GET"],
+                "summary": "查询后台STRM同步状态",
+                "description": "返回当前是否在同步、上次同步时间与结果",
             },
         ]
 
@@ -317,6 +323,28 @@ class P123DiskMulti(_PluginBase):
         """
         拼装插件配置页面，需要返回两块数据：1、页面配置；2、数据结构
         """
+        # 动态获取 MoviePilot 已配置的媒体服务器（供 STRM 刷新选择）
+        server_items: List[str] = []
+        try:
+            services = MediaServerHelper().get_services()
+            server_items = sorted(services.keys())
+        except Exception as e:
+            logger.warn(f"【123多盘】获取媒体服务器列表失败: {e}")
+        # 合并配置中已保存的名称（防止服务器被删除后配置值丢失显示）
+        current_names = self._mediaserver_names
+        if isinstance(current_names, list):
+            current_names = [str(x) for x in current_names]
+        else:
+            current_names = [
+                x.strip()
+                for x in str(current_names or "").split(",")
+                if x.strip()
+            ]
+        server_items = sorted(set(server_items) | set(current_names))
+        if not server_items:
+            server_items_hint = "未检测到媒体服务器，请先在「设置→媒体服务器」中配置"
+        else:
+            server_items_hint = "从 MoviePilot 已配置的媒体服务器中选择，留空则刷新所有"
         return [
             {
                 "component": "VForm",
@@ -598,12 +626,15 @@ class P123DiskMulti(_PluginBase):
                                 "props": {"cols": 12},
                                 "content": [
                                     {
-                                        "component": "VTextField",
+                                        "component": "VSelect",
                                         "props": {
                                             "model": "mediaserver_names",
                                             "label": "媒体服务器名称",
-                                            "placeholder": "Emby",
-                                            "hint": "逗号分隔多个，留空则刷新所有媒体服务器",
+                                            "items": server_items,
+                                            "multiple": True,
+                                            "chips": True,
+                                            "clearable": True,
+                                            "hint": server_items_hint,
                                             "persistent-hint": True,
                                         },
                                     }
@@ -939,6 +970,33 @@ class P123DiskMulti(_PluginBase):
                     "text": f"• MoviePilot 地址：{self._moviepilot_address or '未配置（无法生成 STRM URL）'}",
                 }
             )
+            # 后台同步状态
+            sync_state = self._strm.sync_status() if self._strm else None
+            if sync_state and sync_state.get("running"):
+                strm_status_lines.append(
+                    {
+                        "component": "div",
+                        "props": {"class": "text-caption font-weight-bold"},
+                        "text": "⏳ 正在后台全量同步，请稍后刷新页面查看结果…",
+                    }
+                )
+            elif sync_state and sync_state.get("last_result") is not None:
+                last = sync_state["last_result"]
+                last_time = sync_state.get("last_time") or ""
+                errs = len(last.get("errors") or [])
+                last_text = (
+                    f"• 上次同步：{last_time} · 生成 {last.get('ok', 0)} 个，"
+                    f"跳过 {last.get('skip', 0)} 个，失败 {last.get('fail', 0)} 个"
+                )
+                if errs:
+                    last_text += f"（{errs} 条错误）"
+                strm_status_lines.append(
+                    {
+                        "component": "div",
+                        "props": {"class": "text-caption"},
+                        "text": last_text,
+                    }
+                )
             content[0]["content"].append(
                 {
                     "component": "VCol",
@@ -1305,21 +1363,51 @@ class P123DiskMulti(_PluginBase):
 
     def api_strm_sync(self) -> Dict[str, Any]:
         """
-        全量同步生成 STRM（扫描所有网盘）
+        后台全量同步生成 STRM（立即返回，同步在后台线程执行）
         """
         if not self._strm:
             return {"success": False, "message": "STRM 功能未启用"}
         try:
-            result = self._strm.full_sync(
+            started = self._strm.start_full_sync(
                 self._full_sync_paths or "",
                 overwrite=self._full_sync_overwrite,
+                on_done=self._strm_sync_done,
             )
+        except Exception as e:
+            return {"success": False, "message": f"启动后台同步失败: {e}"}
+        if not started:
+            return {
+                "success": False,
+                "message": "已有全量同步任务正在进行，请稍后再试",
+            }
+        return {
+            "success": True,
+            "background": True,
+            "message": "已开始后台全量同步，请稍后刷新页面查看结果",
+        }
+
+    def api_strm_status(self) -> Dict[str, Any]:
+        """
+        查询后台 STRM 同步状态
+        """
+        if not self._strm:
+            return {"success": False, "message": "STRM 功能未启用"}
+        try:
+            return {"success": True, **self._strm.sync_status()}
+        except Exception as e:
+            return {"success": False, "message": f"查询同步状态失败: {e}"}
+
+    def _strm_sync_done(self, result: Dict[str, Any]):
+        """
+        后台全量同步完成回调（在后台线程中执行）
+
+        :param result: 同步统计结果
+        """
+        try:
             if result.get("paths") and self._refresh_mediaserver:
                 self._refresh_emby(result["paths"])
-            result["success"] = True
-            return result
         except Exception as e:
-            return {"success": False, "message": f"全量同步失败: {e}"}
+            logger.warning(f"【123多盘】同步完成后刷新媒体服务器失败: {e}")
 
     def _refresh_emby(self, paths: List[str]):
         """
@@ -1330,11 +1418,19 @@ class P123DiskMulti(_PluginBase):
         if not paths:
             return
         try:
-            names = [
-                item.strip()
-                for item in str(self._mediaserver_names or "").split(",")
-                if item.strip()
-            ]
+            names_conf = self._mediaserver_names
+            if isinstance(names_conf, list):
+                names = [
+                    str(item).strip()
+                    for item in names_conf
+                    if str(item).strip()
+                ]
+            else:
+                names = [
+                    item.strip()
+                    for item in str(names_conf or "").split(",")
+                    if item.strip()
+                ]
             services = MediaServerHelper().get_services(
                 name_filters=names or None
             )

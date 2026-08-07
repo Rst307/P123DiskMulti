@@ -176,5 +176,33 @@ check(helper.handle_transfer_complete(item_out, "/盘A/纪录片", mappings_text
 item_noinfo = FileItem(storage="123云盘", path="/盘A/电影/x.mkv", name="x.mkv", type="file")
 check(helper.handle_transfer_complete(item_noinfo, "/盘A/电影", mappings_text) is None, "缺少文件信息跳过")
 
+# ============ 6. 后台异步全量同步 ============
+print("== 6. 后台异步全量同步 ==")
+done_flag = {}
+
+
+def on_done(result):
+    done_flag["result"] = result
+
+
+started = helper.start_full_sync(mappings_text, overwrite=False, on_done=on_done)
+check(started is True, "start_full_sync 立即返回 True")
+# 运行中再次触发应被拒绝
+check(helper.start_full_sync(mappings_text, overwrite=False) is False, "运行中再次启动被拒绝")
+busy = helper.full_sync(mappings_text, overwrite=False)
+check("已有全量同步任务" in busy.get("errors", [""])[0], "运行中同步调用返回忙碌错误")
+# 轮询等待后台完成（最多 15 秒）
+import time
+waited = 0
+while helper.sync_status().get("running") and waited < 150:
+    time.sleep(0.1)
+    waited += 1
+st = helper.sync_status()
+check(not st.get("running"), "后台同步最终完成（running=False）")
+check(st.get("last_result") is not None, "状态含上次结果")
+check(st.get("last_time"), "状态含上次时间")
+check(st["last_result"]["ok"] == 0 and st["last_result"]["skip"] == 3, "后台结果正确（默认模式跳过已存在）")
+check("result" in done_flag and done_flag["result"]["skip"] == 3, "完成回调被调用")
+
 print(f"\n结果: {passed} 通过, {failed} 失败")
 sys.exit(1 if failed else 0)
