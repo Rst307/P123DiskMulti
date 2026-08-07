@@ -43,7 +43,7 @@ class P123DiskMulti(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/DDSRem-Dev/MoviePilot-Plugins/main/icons/P123Disk.png"
     # 插件版本
-    plugin_version = "1.3.1"
+    plugin_version = "1.3.2"
     # 插件作者
     plugin_author = "Rst307"
     # 作者主页
@@ -450,9 +450,9 @@ class P123DiskMulti(_PluginBase):
                 "path": "/redirect_url",
                 "endpoint": self.api_redirect_url,
                 "auth": "apikey",
-                "methods": ["GET"],
+                "methods": ["GET", "HEAD"],
                 "summary": "123云盘302跳转（STRM播放）",
-                "description": "根据文件标识实时换取 123 下载地址并 302 重定向，供 Emby 播放 STRM 使用",
+                "description": "根据文件标识实时换取 123 下载地址并 302 重定向，供 Emby 播放 STRM 使用（HEAD 探测也支持）",
             },
             {
                 "path": "/strm_sync",
