@@ -162,7 +162,7 @@ sys.modules["p123client"] = p123client
 
 # 以包方式导入插件模块（p123_api 内部使用相对导入）
 _pkg = types.ModuleType("P123DiskMulti")
-_pkg.__path__ = [str(Path(__file__).parent.parent / "plugins.v2" / "P123DiskMulti")]
+_pkg.__path__ = [str(Path(__file__).parent.parent / "plugins.v2" / "p123diskmulti")]
 sys.modules["P123DiskMulti"] = _pkg
 import P123DiskMulti.p123_api as _p123_api
 DiskAccount = _p123_api.DiskAccount
