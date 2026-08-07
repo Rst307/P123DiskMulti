@@ -479,6 +479,18 @@ class ShareSync:
 
     # ==================== 增量转存 ====================
 
+    def start_run(
+        self, on_done: Optional[Callable[[Dict[str, Any]], None]] = None
+    ) -> bool:
+        """
+        立刻检测转存：后台执行一轮完整的「内容检测 + 增量转存」
+
+        与 start_sync 共用防重入锁（结果包含 check 检测统计，一次遍历分享）。
+
+        :return: True 已启动；False 已有任务在运行
+        """
+        return self.start_sync(on_done=on_done)
+
     def start_sync(
         self, on_done: Optional[Callable[[Dict[str, Any]], None]] = None
     ) -> bool:
@@ -561,9 +573,23 @@ class ShareSync:
         try:
             # 1. 确认历史 pending（存在则转正，不存在则删除以便重新转存）
             result["copied"] += self._confirm_pending()
-            # 2. 遍历分享
+            # 2. 遍历分享（顺带生成内容检测统计：一次遍历同时完成检测与转存）
             items = self.list_share()
             files = [it for it in items if not it.is_dir]
+            dirs = [it for it in items if it.is_dir]
+            result["check"] = {
+                "success": True,
+                "name": self.name,
+                "message": f"可访问：{len(files)} 个文件 / {len(dirs)} 个目录",
+                "files": len(files),
+                "dirs": len(dirs),
+                "total_size": sum(it.size or 0 for it in files),
+                "root_items": [
+                    {"name": it.name, "is_dir": it.is_dir, "size": it.size}
+                    for it in items
+                    if it.path.count("/") == 1
+                ],
+            }
             result["scanned"] = len(files)
             # 3. 过滤已转存 + 映射目标路径
             plans: List[Tuple[ShareFile, str]] = []
@@ -626,6 +652,12 @@ class ShareSync:
             logger.error(f"【123多盘】分享 {self.name} 转存失败: {e}")
             result["success"] = False
             result["failed"] = max(1, result["failed"])
+            result["check"] = {
+                "success": False,
+                "name": self.name,
+                "message": str(e),
+                "files": 0, "dirs": 0, "total_size": 0, "root_items": [],
+            }
             result["errors"].append(str(e))
             return result
 

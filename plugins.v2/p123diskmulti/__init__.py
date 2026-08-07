@@ -43,7 +43,7 @@ class P123DiskMulti(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/DDSRem-Dev/MoviePilot-Plugins/main/icons/P123Disk.png"
     # 插件版本
-    plugin_version = "1.3.2"
+    plugin_version = "1.3.3"
     # 插件作者
     plugin_author = "Rst307"
     # 作者主页
@@ -485,6 +485,14 @@ class P123DiskMulti(_PluginBase):
                 "methods": ["GET"],
                 "summary": "增量转存分享（后台）",
                 "description": "后台服务器端直传转存指定分享的新文件（参数 name=分享名称）",
+            },
+            {
+                "path": "/share/run",
+                "endpoint": self.api_share_run,
+                "auth": "bear",
+                "methods": ["GET"],
+                "summary": "立刻检测转存分享（后台）",
+                "description": "一键完成分享内容检测（可访问性/文件统计）+ 增量转存新文件；参数 name=分享名称，留空则全部任务",
             },
             {
                 "path": "/share/status",
@@ -964,7 +972,7 @@ class P123DiskMulti(_PluginBase):
                                             {
                                                 "component": "div",
                                                 "props": {"class": "text-caption"},
-                                                "text": "• 插件详情页可「检查内容」「立即转存」，转存在后台执行，页面不阻塞",
+                                                "text": "• 插件详情页可「检查内容」「⚡ 立刻检测转存」，转存在后台执行，页面不阻塞；立刻检测转存一键完成分享检测 + 增量转存",
                                             },
                                         ],
                                     }
@@ -1376,10 +1384,18 @@ class P123DiskMulti(_PluginBase):
                 elif st.get("last_result") is not None:
                     last = st["last_result"]
                     errs = len(last.get("errors") or [])
+                    ck = last.get("check") or {}
+                    if ck.get("success"):
+                        ck_text = (
+                            f"可访问（{ck.get('files', 0)} 文件 / {ck.get('dirs', 0)} 目录，"
+                            f"{StringUtils.str_filesize(ck.get('total_size', 0))}）"
+                        )
+                    else:
+                        ck_text = f"失败：{ck.get('message') or '分享不可访问'}"
                     last_text = (
-                        f"• 上次转存：{st.get('last_time') or ''} · 扫描 {last.get('scanned', 0)}，"
-                        f"新增 {last.get('copied', 0)}，跳过 {last.get('skipped', 0)}，"
-                        f"失败 {last.get('failed', 0)}"
+                        f"• 上次检测转存：{st.get('last_time') or ''} · {ck_text}\n"
+                        f"  扫描 {last.get('scanned', 0)}，新增 {last.get('copied', 0)}，"
+                        f"跳过 {last.get('skipped', 0)}，失败 {last.get('failed', 0)}"
                     )
                     if errs:
                         last_text += f"（{errs} 条错误）"
@@ -1437,12 +1453,12 @@ class P123DiskMulti(_PluginBase):
                                                             "variant": "tonal",
                                                             "size": "small",
                                                             "class": "ml-2",
-                                                            "prepend-icon": "mdi-cloud-download",
+                                                            "prepend-icon": "mdi-cloud-sync",
                                                         },
-                                                        "text": "立即转存",
+                                                        "text": "⚡ 立刻检测转存",
                                                         "events": {
                                                             "click": {
-                                                                "api": "plugin/P123DiskMulti/share/sync",
+                                                                "api": "plugin/P123DiskMulti/share/run",
                                                                 "method": "get",
                                                                 "params": {"name": task.name},
                                                             },
@@ -1852,6 +1868,41 @@ class P123DiskMulti(_PluginBase):
             "success": True,
             "background": True,
             "message": "已开始后台增量转存，请稍后刷新页面查看结果",
+        }
+
+    def api_share_run(self, request: Request) -> Dict[str, Any]:
+        """
+        立刻检测转存指定分享（后台执行）
+
+        GET /share/run?name=分享名称；name 为空则依次启动全部分享任务。
+        一轮完成：分享内容检测（可访问性 + 文件统计）+ 增量转存新文件。
+        """
+        name = request.query_params.get("name") or ""
+        if name:
+            task = self._find_share(name)
+            if not task:
+                return {"success": False, "message": "分享任务不存在"}
+            tasks = [task]
+        else:
+            tasks = list(self._shares)
+        if not tasks:
+            return {"success": False, "message": "未配置分享任务"}
+        started = []
+        for task in tasks:
+            try:
+                if task.start_run():
+                    started.append(task.name)
+            except Exception as e:
+                return {"success": False, "message": f"启动失败: {e}"}
+        if not started:
+            return {
+                "success": False,
+                "message": "已有转存任务正在运行，请稍后再试",
+            }
+        return {
+            "success": True,
+            "background": True,
+            "message": f"已开始立刻检测转存：{'、'.join(started)}",
         }
 
     def api_share_status(self, request: Request = None) -> Dict[str, Any]:
