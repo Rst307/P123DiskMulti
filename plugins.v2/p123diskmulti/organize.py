@@ -57,6 +57,8 @@ class OrganizeRunner:
         self._last_time: Optional[str] = None
         self._last_result: Optional[Dict] = None
         self._on_done_ref = None
+        # 因目标已有更好文件而自动删除的源文件累计数
+        self._deleted_count = 0
 
     # ---------------------------------------------------------------- 外部入口
 
@@ -101,6 +103,7 @@ class OrganizeRunner:
             "running": self._running,
             "last_time": self._last_time,
             "last_result": self._last_result,
+            "deleted": self._deleted_count,
         }
 
     # ---------------------------------------------------------------- 后台线程
@@ -220,3 +223,54 @@ class OrganizeRunner:
             return bool(state), str(errmsg)
         except Exception as e:
             return False, f"整理链调用异常: {e}"
+
+    # ---------------------------------------------------------------- 失败自动清理
+
+    def handle_transfer_failed(self, event_data: Dict) -> bool:
+        """
+        处理 MoviePilot 整理失败事件：源文件在 123 盘且失败原因为目标已有更好文件时，
+        删除网盘上的低版本源文件（移入回收站，可恢复）
+
+        :param event_data: TransferFailed 事件数据（fileitem / transferinfo 等）
+        :return: True 已删除；False 未处理
+        """
+        try:
+            if not isinstance(event_data, dict):
+                return False
+            transferinfo = event_data.get("transferinfo")
+            if transferinfo is None:
+                return False
+            # 只有失败事件才处理
+            if getattr(transferinfo, "success", True):
+                return False
+            # 失败原因必须是目标已有更好的文件
+            message = str(getattr(transferinfo, "message", "") or "")
+            if "质量更好" not in message:
+                return False
+            fileitem = event_data.get("fileitem")
+            if not fileitem or getattr(fileitem, "storage", "") != getattr(
+                self._api, "disk_name", "123云盘"
+            ):
+                return False
+            path = getattr(fileitem, "path", "")
+            if not path:
+                return False
+            # 确认源文件仍存在（可能已被其他流程处理）
+            item = self._api.get_item(path)
+            if item is None:
+                logger.info(
+                    f"【123多盘整理】源文件已不存在，跳过清理: {path}"
+                )
+                return False
+            # 删除（移入回收站）
+            if not self._api.delete(item):
+                logger.error(f"【123多盘整理】删除低版本文件失败: {path}")
+                return False
+            self._deleted_count += 1
+            logger.info(
+                f"【123多盘整理】目标已有更好文件，已删除网盘低版本文件（回收站可恢复）: {path}"
+            )
+            return True
+        except Exception as e:
+            logger.error(f"【123多盘整理】整理失败自动清理异常: {e}")
+            return False

@@ -44,7 +44,7 @@ class P123DiskMulti(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/DDSRem-Dev/MoviePilot-Plugins/main/icons/P123Disk.png"
     # 插件版本
-    plugin_version = "1.4.0"
+    plugin_version = "1.4.1"
     # 插件作者
     plugin_author = "Rst307"
     # 作者主页
@@ -113,6 +113,9 @@ class P123DiskMulti(_PluginBase):
             self._organize_enabled = config.get("organize_enabled", False)
             self._organize_paths = config.get("organize_paths") or ""
             self._organize_cron = config.get("organize_cron") or DEFAULT_ORGANIZE_CRON
+            self._organize_delete_better = config.get(
+                "organize_delete_better", True
+            )
 
             # 解析网盘账号列表
             accounts = self._parse_disks(config)
@@ -235,6 +238,21 @@ class P123DiskMulti(_PluginBase):
         started = self._organize.start_organize(self._organize_paths or "")
         if not started:
             logger.info("【123多盘】定时整理触发时已有整理任务在运行，跳过本次")
+
+    @eventmanager.register(EventType.TransferFailed)
+    def organize_transfer_failed(self, event: Event):
+        """
+        监听整理失败事件：源文件在 123 盘且失败原因为目标已有更好文件时，
+        自动删除网盘上的低版本源文件（移入回收站）
+        """
+        if not self._enabled or not self._organize:
+            return
+        if not self._organize_delete_better:
+            return
+        try:
+            self._organize.handle_transfer_failed(event.event_data)
+        except Exception as e:
+            logger.error(f"【123多盘】整理失败自动清理异常: {e}")
 
     def _init_shares(self):
         """
@@ -1109,6 +1127,22 @@ class P123DiskMulti(_PluginBase):
                             },
                             {
                                 "component": "VCol",
+                                "props": {"cols": 12, "md": 8},
+                                "content": [
+                                    {
+                                        "component": "VSwitch",
+                                        "props": {
+                                            "model": "organize_delete_better",
+                                            "label": "整理失败自动删除网盘低版本文件",
+                                            "color": "primary",
+                                            "hint": "整理失败原因为「媒体库已有同名且质量更好」时，自动删除网盘上的源文件（移入回收站可恢复）",
+                                            "persistent-hint": True,
+                                        },
+                                    }
+                                ],
+                            },
+                            {
+                                "component": "VCol",
                                 "props": {"cols": 12},
                                 "content": [
                                     {
@@ -1157,6 +1191,11 @@ class P123DiskMulti(_PluginBase):
                                                 "component": "div",
                                                 "props": {"class": "text-caption"},
                                                 "text": "• 同盘移动为 123 服务器端秒级操作；整理完成后 MoviePilot 会自动通知媒体服务器刷新",
+                                            },
+                                            {
+                                                "component": "div",
+                                                "props": {"class": "text-caption"},
+                                                "text": "• 整理失败且原因「媒体库已有同名且质量更好」时，自动删除网盘上的低版本源文件（移入回收站，可恢复），释放空间",
                                             },
                                         ],
                                     }
@@ -1227,6 +1266,7 @@ class P123DiskMulti(_PluginBase):
             "organize_enabled": False,
             "organize_paths": "",
             "organize_cron": "0 3 * * *",
+            "organize_delete_better": True,
         }
 
     def get_page(self) -> List[dict]:
@@ -1716,6 +1756,14 @@ class P123DiskMulti(_PluginBase):
                         "component": "div",
                         "props": {"class": "text-caption"},
                         "text": last_text,
+                    }
+                )
+            if org_state.get("deleted"):
+                organize_lines.append(
+                    {
+                        "component": "div",
+                        "props": {"class": "text-caption"},
+                        "text": f"• 已自动清理低版本文件：{org_state.get('deleted')} 个（因媒体库已有更好文件）",
                     }
                 )
             content[0]["content"].append(

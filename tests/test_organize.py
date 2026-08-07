@@ -14,6 +14,7 @@ import sys
 import time
 import types
 from pathlib import Path
+from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).parent))
 import test_logic as tl  # noqa: E402
@@ -222,6 +223,93 @@ def test_background_start_status_and_callback():
         time.sleep(0.05)
 
 
+def test_transfer_failed_better_file_deletion():
+    print("\n[9] 整理失败「质量更好」：自动删除网盘低版本源文件")
+    api, _, _ = build_env()
+    runner = OrganizeRunner(api=api)
+    check(api.get_item("/盘A/整理/阿凡达.mkv") is not None, "源文件初始存在")
+
+    # 1. 质量更好 + 123盘源 → 删除（移入回收站）
+    ev = {
+        "fileitem": SimpleNamespace(
+            storage="123云盘", path="/盘A/整理/阿凡达.mkv"
+        ),
+        "transferinfo": SimpleNamespace(
+            success=False, message="媒体库存在同名文件，且质量更好"
+        ),
+    }
+    ok = runner.handle_transfer_failed(ev)
+    check(ok is True, "质量更好失败 → 删除成功")
+    check(api.get_item("/盘A/整理/阿凡达.mkv") is None, "网盘源文件已删除")
+    check(runner.organize_status()["deleted"] == 1, "deleted 累计为 1")
+
+    # 2. 成功事件 → 不删
+    ev2 = {
+        "fileitem": SimpleNamespace(
+            storage="123云盘", path="/盘A/整理/剧集 S01E01.mkv"
+        ),
+        "transferinfo": SimpleNamespace(
+            success=True, message="媒体库存在同名文件，且质量更好"
+        ),
+    }
+    ok2 = runner.handle_transfer_failed(ev2)
+    check(ok2 is False, "成功事件不处理")
+    check(api.get_item("/盘A/整理/剧集 S01E01.mkv") is not None, "成功事件源文件保留")
+
+    # 3. 其他失败原因 → 不删
+    ev3 = {
+        "fileitem": SimpleNamespace(
+            storage="123云盘", path="/盘A/整理/剧集 S01E01.mkv"
+        ),
+        "transferinfo": SimpleNamespace(success=False, message="磁盘空间不足"),
+    }
+    ok3 = runner.handle_transfer_failed(ev3)
+    check(ok3 is False, "其他失败原因不处理")
+    check(api.get_item("/盘A/整理/剧集 S01E01.mkv") is not None, "其他原因源文件保留")
+
+    # 4. 非 123 盘源 → 不删
+    ev4 = {
+        "fileitem": SimpleNamespace(storage="local", path="/download/阿凡达.mkv"),
+        "transferinfo": SimpleNamespace(
+            success=False, message="媒体库存在同名文件，且质量更好"
+        ),
+    }
+    ok4 = runner.handle_transfer_failed(ev4)
+    check(ok4 is False, "非 123 盘源不处理")
+
+    # 5. 源文件已不存在 → 不删不报错
+    ev5 = {
+        "fileitem": SimpleNamespace(
+            storage="123云盘", path="/盘A/整理/子目录/内.mp4"
+        ),
+        "transferinfo": SimpleNamespace(
+            success=False, message="媒体库存在同名文件，且质量更好"
+        ),
+    }
+    api.delete(api.get_item("/盘A/整理/子目录/内.mp4"))
+    ok5 = runner.handle_transfer_failed(ev5)
+    check(ok5 is False, "源文件已不存在则不处理")
+
+    # 6. 事件数据不是 dict / 缺字段 → 容错
+    check(runner.handle_transfer_failed(None) is False, "None 事件数据容错")
+    check(runner.handle_transfer_failed({"fileitem": None}) is False, "缺 transferinfo 容错")
+
+    # 7. 删除失败 → 不计数
+    ev7 = {
+        "fileitem": SimpleNamespace(
+            storage="123云盘", path="/盘A/整理/剧集 S01E01.mkv"
+        ),
+        "transferinfo": SimpleNamespace(
+            success=False, message="媒体库存在同名文件，且质量更好"
+        ),
+    }
+    check(api.get_item("/盘A/整理/剧集 S01E01.mkv") is not None, "源文件仍在")
+    api.delete = lambda fileitem: False  # 模拟删除失败
+    ok7 = runner.handle_transfer_failed(ev7)
+    check(ok7 is False, "删除失败返回 False")
+    check(runner.organize_status()["deleted"] == 1, "删除失败不计数（仍为 1）")
+
+
 def test_main():
     test_walk_collects_only_media()
     test_submit_all_files_to_transfer_chain()
@@ -231,6 +319,7 @@ def test_main():
     test_chain_exception_tolerated()
     test_custom_media_exts()
     test_background_start_status_and_callback()
+    test_transfer_failed_better_file_deletion()
     print(f"\n结果: {passed} 通过, {failed} 失败")
     sys.exit(1 if failed else 0)
 
