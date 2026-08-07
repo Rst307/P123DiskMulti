@@ -302,6 +302,32 @@ class FakeP123Client:
         return any(e["FileName"] == name and e["Type"] == 1
                    for e in self.entries.values() if e["ParentFileId"] == 0)
 
+    # ---------- 分享 API（ShareSync 测试用） ----------
+
+    def share_fs_list(self, payload, base_url="", **kwargs):
+        """模拟分享目录列表：从 share_entries 按 parentFileId 取，支持分页"""
+        entries = getattr(self, "share_entries", None) or {}
+        if not isinstance(entries, dict):
+            return {"code": 0, "data": {"InfoList": [], "Next": "-1"}}
+        parent = payload.get("parentFileId", 0)
+        items = entries.get(int(parent), [])
+        page = max(1, int(payload.get("Page", 1)))
+        limit = max(1, int(payload.get("limit", 100)))
+        chunk = items[(page - 1) * limit: page * limit]
+        return {"code": 0, "data": {"InfoList": [dict(e) for e in chunk], "Next": "-1"}}
+
+    def share_fs_copy(self, payload, parent_id=0, base_url="", **kwargs):
+        """模拟分享转存（服务器端直传）：把文件复制到目标盘"""
+        if getattr(self, "fail_share_copy", False):
+            raise RuntimeError("fake share copy failed")
+        if getattr(self, "defer_share_copy", False):
+            # 模拟异步转存尚未完成：不创建条目
+            return {"code": 0}
+        for item in payload.get("file_list", []) or []:
+            self._entry(item["file_name"], int(parent_id or 0), "file",
+                        size=item.get("size") or 0, etag=item.get("etag") or "")
+        return {"code": 0}
+
     def upload_complete(self, data):
         # 返回本次上传创建的文件条目
         e = self.last_upload

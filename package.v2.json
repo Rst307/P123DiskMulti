@@ -3,13 +3,14 @@
     "name": "123云盘多盘合并",
     "description": "将多个123网盘账号合并为一个存储空间，支持网盘间互传、空间不足自动切换网盘、合并空间显示、多盘STRM助手。",
     "labels": "云盘",
-    "version": "1.2.0",
+    "version": "1.3.0",
     "icon": "https://raw.githubusercontent.com/DDSRem-Dev/MoviePilot-Plugins/main/icons/P123Disk.png",
     "author": "Rst307",
     "system_version": ">=2.15.2",
     "level": 1,
     "history": {
-      "v1.2.0": "全量同步改为后台异步执行（页面立即返回/状态查询/防并发）；媒体服务器名称改为从 MoviePilot 已配置服务器下拉多选",
+      "v1.3.0": "新增分享增量同步：123分享内容检查 + 服务器端直传转存新文件（多盘多分享/后台执行/SQLite增量去重/转存确认）",
+      "v1.2.0": "全量同步改为后台异步执行（状态查询/防并发/完成回调刷新）；媒体服务器名称改为从 MoviePilot 已配置服务器下拉多选",
       "v1.1.0": "新增多盘 STRM 功能：302直链播放、整理入库自动生成、全量/定时同步（所有网盘通用）",
       "v1.0.0": "发布"
     }

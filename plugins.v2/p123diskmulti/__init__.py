@@ -19,12 +19,15 @@ from app.schemas.types import ChainEventType, EventType
 from app.utils.string import StringUtils
 
 from .p123_api import DiskAccount, P123MultiApi
+from .share import ShareSync
 from .strm import DEFAULT_MEDIA_EXTS, StrmHelper
 
 # 默认网盘名称（旧版单盘配置迁移时使用）
 LEGACY_DISK_NAME = "盘1"
 # 默认全量同步 cron（每 7 小时）
 DEFAULT_STRM_CRON = "0 */7 * * *"
+# 默认分享同步 cron（每 6 小时）
+DEFAULT_SHARE_CRON = "0 */6 * * *"
 
 
 class P123DiskMulti(_PluginBase):
@@ -40,7 +43,7 @@ class P123DiskMulti(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/DDSRem-Dev/MoviePilot-Plugins/main/icons/P123Disk.png"
     # 插件版本
-    plugin_version = "1.2.0"
+    plugin_version = "1.3.0"
     # 插件作者
     plugin_author = "Rst307"
     # 作者主页
@@ -65,6 +68,8 @@ class P123DiskMulti(_PluginBase):
         # STRM 助手与定时任务
         self._strm: Optional[StrmHelper] = None
         self._scheduler: Optional[BackgroundScheduler] = None
+        # 分享增量同步任务
+        self._shares: List[ShareSync] = []
 
     def init_plugin(self, config: dict = None):
         """
@@ -95,6 +100,11 @@ class P123DiskMulti(_PluginBase):
             self._refresh_mediaserver = config.get("refresh_mediaserver", False)
             self._mediaserver_names = config.get("mediaserver_names") or ""
 
+            # 分享增量同步配置
+            self._share_enabled = config.get("share_enabled", False)
+            self._shares_text = config.get("shares_text") or ""
+            self._share_cron = config.get("share_cron") or DEFAULT_SHARE_CRON
+
             # 解析网盘账号列表
             accounts = self._parse_disks(config)
 
@@ -122,6 +132,8 @@ class P123DiskMulti(_PluginBase):
                     )
                     # 初始化 STRM 助手（多盘）
                     self._init_strm()
+                    # 初始化分享增量同步
+                    self._init_shares()
                 else:
                     logger.warn("【123多盘】未配置任何网盘账号，请填写网盘账号列表")
             else:
@@ -174,6 +186,145 @@ class P123DiskMulti(_PluginBase):
         )
         if not started:
             logger.info("【123多盘】定时同步触发时已有同步任务在运行，跳过本次")
+
+    def _init_shares(self):
+        """
+        初始化分享增量同步任务与定时服务
+        """
+        self._shares = []
+        if not self._share_enabled:
+            logger.info("【123多盘】分享增量同步未启用")
+            return
+        db_path = self.get_data_path() / "p123sharesync.sqlite3"
+        for conf in self._parse_shares(self._shares_text):
+            try:
+                task = ShareSync(
+                    api=self._api,
+                    task_id=conf["task_id"],
+                    name=conf["name"],
+                    share_key=conf["share_key"],
+                    share_pwd=conf["share_pwd"],
+                    target_vpath=conf["target_path"],
+                    db_path=db_path,
+                )
+                self._shares.append(task)
+                logger.info(
+                    f"【123多盘】分享任务已加载: {conf['name']} -> {conf['target_path']}"
+                )
+            except Exception as e:
+                logger.error(f"【123多盘】分享任务 {conf['name']} 加载失败: {e}")
+        if not self._shares:
+            return
+        # 定时增量转存（复用 STRM 的调度器，仅首次创建）
+        if self._share_cron:
+            try:
+                trigger = CronTrigger.from_crontab(self._share_cron)
+                if not self._scheduler:
+                    self._scheduler = BackgroundScheduler(
+                        timezone=settings.TZ
+                    )
+                    self._scheduler.start()
+                self._scheduler.add_job(
+                    func=self._scheduled_share_sync,
+                    trigger=trigger,
+                    id="p123diskmulti_share_sync",
+                    name="123多盘分享增量同步",
+                    max_instances=1,
+                    coalesce=True,
+                )
+                logger.info(
+                    f"【123多盘】分享定时增量转存已启动: {self._share_cron}"
+                )
+            except Exception as e:
+                logger.error(f"【123多盘】分享定时任务启动失败: {e}")
+
+    def _scheduled_share_sync(self):
+        """
+        定时增量转存所有分享（后台执行）
+        """
+        for task in self._shares:
+            if not task.start_sync():
+                logger.info(f"【123多盘】分享 {task.name} 已有转存任务在运行，跳过本次")
+
+    @staticmethod
+    def _parse_shares(shares_text: str) -> List[Dict[str, Any]]:
+        """
+        解析分享同步配置
+
+        支持两种格式：
+        1. 每行一条：网盘名称,分享链接或分享码,提取码,目标目录（提取码可为空：名称,链接,,目标目录）
+        2. JSON 数组：[{"name":..., "share_key":..., "share_pwd":..., "target_path":...}]
+        """
+        result: List[Dict[str, Any]] = []
+        raw = shares_text
+        if isinstance(raw, (list, dict)):
+            items = raw if isinstance(raw, list) else [raw]
+        else:
+            text = str(raw or "").strip()
+            if text.startswith("["):
+                try:
+                    items = json.loads(text)
+                except Exception:
+                    items = []
+            else:
+                items = [
+                    line
+                    for line in text.splitlines()
+                    if line.strip() and not line.strip().startswith("#")
+                ]
+        used_ids = set()
+        for index, item in enumerate(items):
+            if isinstance(item, dict):
+                name = str(
+                    item.get("name") or item.get("id") or f"分享{index + 1}"
+                ).strip()
+                share_key = str(
+                    item.get("share_key")
+                    or item.get("share_url")
+                    or item.get("share_code")
+                    or ""
+                ).strip()
+                share_pwd = str(
+                    item.get("share_pwd") or item.get("share_password") or ""
+                ).strip()
+                target_path = str(
+                    item.get("target_path") or item.get("target") or ""
+                ).strip()
+            else:
+                parts = [part.strip() for part in str(item).split(",", 3)]
+                if len(parts) < 4:
+                    logger.warn(f"【123多盘】忽略无效分享配置行: {item}")
+                    continue
+                name, share_key, share_pwd, target_path = parts
+            if not name or not share_key or not target_path:
+                logger.warn(f"【123多盘】忽略不完整的分享配置: {item}")
+                continue
+            # 名称去重，避免身份命名空间冲突
+            task_id = name
+            if task_id in used_ids:
+                task_id = f"{name}-{index + 1}"
+            used_ids.add(task_id)
+            result.append(
+                {
+                    "task_id": task_id,
+                    "name": name,
+                    "share_key": share_key,
+                    "share_pwd": share_pwd,
+                    "target_path": target_path.rstrip("/"),
+                }
+            )
+        return result
+
+    def _find_share(self, name: str = "") -> Optional[ShareSync]:
+        """
+        按名称或任务 ID 查找分享任务
+        """
+        if not name:
+            return None
+        for task in self._shares:
+            if task.name == name or task.task_id == name:
+                return task
+        return None
 
     @staticmethod
     def _parse_disks(config: dict) -> List[DiskAccount]:
@@ -316,6 +467,30 @@ class P123DiskMulti(_PluginBase):
                 "methods": ["GET"],
                 "summary": "查询后台STRM同步状态",
                 "description": "返回当前是否在同步、上次同步时间与结果",
+            },
+            {
+                "path": "/share/check",
+                "endpoint": self.api_share_check,
+                "auth": "bear",
+                "methods": ["GET"],
+                "summary": "检查分享内容",
+                "description": "检查指定 123 分享的可访问性与文件统计（参数 name=分享名称）",
+            },
+            {
+                "path": "/share/sync",
+                "endpoint": self.api_share_sync,
+                "auth": "bear",
+                "methods": ["GET"],
+                "summary": "增量转存分享（后台）",
+                "description": "后台服务器端直传转存指定分享的新文件（参数 name=分享名称）",
+            },
+            {
+                "path": "/share/status",
+                "endpoint": self.api_share_status,
+                "auth": "bear",
+                "methods": ["GET"],
+                "summary": "查询分享任务状态",
+                "description": "返回所有分享任务的运行状态、已转存数量与上次结果",
             },
         ]
 
@@ -678,6 +853,116 @@ class P123DiskMulti(_PluginBase):
                                     }
                                 ],
                             },
+                            # 分享增量同步
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12},
+                                "content": [
+                                    {
+                                        "component": "VDivider",
+                                        "props": {"class": "my-2"},
+                                    }
+                                ],
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12},
+                                "content": [
+                                    {
+                                        "component": "div",
+                                        "props": {
+                                            "class": "text-subtitle-1 font-weight-bold mb-1"
+                                        },
+                                        "text": "📤 分享增量同步（多盘支持）",
+                                    }
+                                ],
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 4},
+                                "content": [
+                                    {
+                                        "component": "VSwitch",
+                                        "props": {
+                                            "model": "share_enabled",
+                                            "label": "启用分享增量同步",
+                                            "color": "primary",
+                                            "hint": "定时检查分享内容，服务器端直传转存新文件（不占本地带宽）",
+                                            "persistent-hint": True,
+                                        },
+                                    }
+                                ],
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 8},
+                                "content": [
+                                    {
+                                        "component": "VTextField",
+                                        "props": {
+                                            "model": "share_cron",
+                                            "label": "定时增量转存（cron）",
+                                            "hint": "留空则不自动转存；默认每 6 小时",
+                                            "persistent-hint": True,
+                                        },
+                                    }
+                                ],
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12},
+                                "content": [
+                                    {
+                                        "component": "VTextarea",
+                                        "props": {
+                                            "model": "shares_text",
+                                            "rows": 4,
+                                            "label": "分享任务列表（每行一个）",
+                                            "placeholder": "名称,分享链接或分享码,提取码,目标目录\n例如：\n电影分享,https://www.123pan.com/s/AbC123-DEF,1234,/盘A/分享/电影\n剧集分享,Sa7K8-QwEr,,/盘B/分享/剧集",
+                                            "hint": "提取码可为空（留空字段）；目标目录必须带网盘前缀，转存时保留分享目录结构，只转存新文件",
+                                            "persistent-hint": True,
+                                        },
+                                    }
+                                ],
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12},
+                                "content": [
+                                    {
+                                        "component": "VAlert",
+                                        "props": {
+                                            "type": "info",
+                                            "variant": "tonal",
+                                            "density": "compact",
+                                        },
+                                        "content": [
+                                            {
+                                                "component": "div",
+                                                "props": {
+                                                    "class": "text-subtitle-2 font-weight-bold mb-1"
+                                                },
+                                                "text": "💡 分享同步说明",
+                                            },
+                                            {
+                                                "component": "div",
+                                                "props": {"class": "text-caption"},
+                                                "text": "• 转存为 123 服务器端直传（云端到云端），速度与本地网络无关，也不占磁盘空间",
+                                            },
+                                            {
+                                                "component": "div",
+                                                "props": {"class": "text-caption"},
+                                                "text": "• 已转存文件记录在插件数据目录的 SQLite 中，同名文件增删后不会重复转存",
+                                            },
+                                            {
+                                                "component": "div",
+                                                "props": {"class": "text-caption"},
+                                                "text": "• 插件详情页可「检查内容」「立即转存」，转存在后台执行，页面不阻塞",
+                                            },
+                                        ],
+                                    }
+                                ],
+                            },
                             # 注意事项
                             {
                                 "component": "VCol",
@@ -735,6 +1020,10 @@ class P123DiskMulti(_PluginBase):
             "full_sync_overwrite": False,
             "refresh_mediaserver": False,
             "mediaserver_names": "",
+            # 分享增量同步默认配置
+            "share_enabled": False,
+            "shares_text": "",
+            "share_cron": "0 */6 * * *",
         }
 
     def get_page(self) -> List[dict]:
@@ -1052,6 +1341,120 @@ class P123DiskMulti(_PluginBase):
                     ],
                 }
             )
+
+        # 分享增量同步卡片
+        if self._shares:
+            for task in self._shares:
+                st = task.status()
+                share_lines = [
+                    {
+                        "component": "div",
+                        "props": {"class": "text-caption"},
+                        "text": f"• 分享标识：{st['share_key']}（脱敏）｜目标目录：{st['target_vpath']}",
+                    },
+                    {
+                        "component": "div",
+                        "props": {"class": "text-caption"},
+                        "text": f"• 已转存：{st['synced']} 个文件",
+                    },
+                ]
+                if st.get("running"):
+                    share_lines.append(
+                        {
+                            "component": "div",
+                            "props": {"class": "text-caption font-weight-bold"},
+                            "text": "⏳ 正在后台增量转存，请稍后刷新页面查看结果…",
+                        }
+                    )
+                elif st.get("last_result") is not None:
+                    last = st["last_result"]
+                    errs = len(last.get("errors") or [])
+                    last_text = (
+                        f"• 上次转存：{st.get('last_time') or ''} · 扫描 {last.get('scanned', 0)}，"
+                        f"新增 {last.get('copied', 0)}，跳过 {last.get('skipped', 0)}，"
+                        f"失败 {last.get('failed', 0)}"
+                    )
+                    if errs:
+                        last_text += f"（{errs} 条错误）"
+                    share_lines.append(
+                        {
+                            "component": "div",
+                            "props": {"class": "text-caption"},
+                            "text": last_text,
+                        }
+                    )
+                content[0]["content"].append(
+                    {
+                        "component": "VCol",
+                        "props": {"cols": 12, "md": 6},
+                        "content": [
+                            {
+                                "component": "VCard",
+                                "props": {"variant": "tonal"},
+                                "content": [
+                                    {
+                                        "component": "VCardText",
+                                        "content": [
+                                            {
+                                                "component": "div",
+                                                "content": [
+                                                    {
+                                                        "component": "span",
+                                                        "props": {
+                                                            "class": "text-subtitle-1 font-weight-bold"
+                                                        },
+                                                        "text": f"📤 分享：{task.name}",
+                                                    },
+                                                    {
+                                                        "component": "VBtn",
+                                                        "props": {
+                                                            "color": "secondary",
+                                                            "variant": "tonal",
+                                                            "size": "small",
+                                                            "class": "ml-2",
+                                                            "prepend-icon": "mdi-magnify",
+                                                        },
+                                                        "text": "检查内容",
+                                                        "events": {
+                                                            "click": {
+                                                                "api": "plugin/P123DiskMulti/share/check",
+                                                                "method": "get",
+                                                                "params": {"name": task.name},
+                                                            },
+                                                        },
+                                                    },
+                                                    {
+                                                        "component": "VBtn",
+                                                        "props": {
+                                                            "color": "primary",
+                                                            "variant": "tonal",
+                                                            "size": "small",
+                                                            "class": "ml-2",
+                                                            "prepend-icon": "mdi-cloud-download",
+                                                        },
+                                                        "text": "立即转存",
+                                                        "events": {
+                                                            "click": {
+                                                                "api": "plugin/P123DiskMulti/share/sync",
+                                                                "method": "get",
+                                                                "params": {"name": task.name},
+                                                            },
+                                                        },
+                                                    },
+                                                ],
+                                            },
+                                            {
+                                                "component": "div",
+                                                "props": {"class": "mt-2"},
+                                                "content": share_lines,
+                                            },
+                                        ],
+                                    }
+                                ],
+                            }
+                        ],
+                    }
+                )
         return content
 
     def get_module(self) -> Dict[str, Any]:
@@ -1409,6 +1812,50 @@ class P123DiskMulti(_PluginBase):
         except Exception as e:
             logger.warning(f"【123多盘】同步完成后刷新媒体服务器失败: {e}")
 
+    def api_share_check(self, request: Request) -> Dict[str, Any]:
+        """
+        检查指定分享内容（可访问性 + 文件统计）
+
+        GET /share/check?name=分享名称
+        """
+        task = self._find_share(request.query_params.get("name") or "")
+        if not task:
+            return {"success": False, "message": "分享任务不存在"}
+        return task.check()
+
+    def api_share_sync(self, request: Request) -> Dict[str, Any]:
+        """
+        后台增量转存指定分享（立即返回，转存在后台线程执行）
+
+        GET /share/sync?name=分享名称
+        """
+        task = self._find_share(request.query_params.get("name") or "")
+        if not task:
+            return {"success": False, "message": "分享任务不存在"}
+        try:
+            started = task.start_sync()
+        except Exception as e:
+            return {"success": False, "message": f"启动后台转存失败: {e}"}
+        if not started:
+            return {
+                "success": False,
+                "message": "已有转存任务正在进行，请稍后再试",
+            }
+        return {
+            "success": True,
+            "background": True,
+            "message": "已开始后台增量转存，请稍后刷新页面查看结果",
+        }
+
+    def api_share_status(self, request: Request = None) -> Dict[str, Any]:
+        """
+        查询所有分享任务状态
+        """
+        return {
+            "success": True,
+            "shares": [task.status() for task in self._shares],
+        }
+
     def _refresh_emby(self, paths: List[str]):
         """
         刷新媒体服务器媒体库（批量，失败仅记录日志）
@@ -1469,5 +1916,11 @@ class P123DiskMulti(_PluginBase):
             except Exception:
                 pass
             self._scheduler = None
+        for task in self._shares:
+            try:
+                task.close()
+            except Exception:
+                pass
+        self._shares = []
         self._strm = None
         self._api = None
