@@ -2,19 +2,29 @@ import json
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+from apscheduler.schedulers.background import BackgroundScheduler
+from apscheduler.triggers.cron import CronTrigger
+from fastapi import Request
+from fastapi.responses import JSONResponse, RedirectResponse
+
 from app import schemas
+from app.core.config import settings
 from app.core.event import Event, eventmanager
+from app.helper.mediaserver import MediaServerHelper
 from app.helper.storage import StorageHelper
 from app.log import logger
 from app.plugins import _PluginBase
-from app.schemas import FileItem, StorageOperSelectionEventData
-from app.schemas.types import ChainEventType
+from app.schemas import FileItem, RefreshMediaItem, StorageOperSelectionEventData
+from app.schemas.types import ChainEventType, EventType
 from app.utils.string import StringUtils
 
 from .p123_api import DiskAccount, P123MultiApi
+from .strm import DEFAULT_MEDIA_EXTS, StrmHelper
 
 # 默认网盘名称（旧版单盘配置迁移时使用）
 LEGACY_DISK_NAME = "盘1"
+# 默认全量同步 cron（每 7 小时）
+DEFAULT_STRM_CRON = "0 */7 * * *"
 
 
 class P123DiskMulti(_PluginBase):
@@ -52,12 +62,17 @@ class P123DiskMulti(_PluginBase):
     def __init__(self):
         super().__init__()
         self._disk_name = "123云盘"
+        # STRM 助手与定时任务
+        self._strm: Optional[StrmHelper] = None
+        self._scheduler: Optional[BackgroundScheduler] = None
 
     def init_plugin(self, config: dict = None):
         """
         初始化插件
         """
         self._api = None
+        self._strm = None
+        self.stop_service()
         if config:
             self._enabled = config.get("enabled", False)
             self._auto_switch = config.get("auto_switch", True)
@@ -67,6 +82,18 @@ class P123DiskMulti(_PluginBase):
                 )
             except Exception:
                 self._reserve_size = 0
+
+            # STRM 功能配置
+            self._strm_enabled = config.get("strm_enabled", False)
+            self._moviepilot_address = config.get("moviepilot_address") or ""
+            self._transfer_monitor_paths = (
+                config.get("transfer_monitor_paths") or ""
+            )
+            self._full_sync_paths = config.get("full_sync_paths") or ""
+            self._full_sync_cron = config.get("full_sync_cron") or DEFAULT_STRM_CRON
+            self._full_sync_overwrite = config.get("full_sync_overwrite", False)
+            self._refresh_mediaserver = config.get("refresh_mediaserver", False)
+            self._mediaserver_names = config.get("mediaserver_names") or ""
 
             # 解析网盘账号列表
             accounts = self._parse_disks(config)
@@ -93,10 +120,62 @@ class P123DiskMulti(_PluginBase):
                     logger.info(
                         f"【123多盘】插件已启用，共 {len(accounts)} 个网盘：{', '.join(a.name for a in accounts)}"
                     )
+                    # 初始化 STRM 助手（多盘）
+                    self._init_strm()
                 else:
                     logger.warn("【123多盘】未配置任何网盘账号，请填写网盘账号列表")
             else:
                 logger.info("【123多盘】插件未启用")
+
+    def _init_strm(self):
+        """
+        初始化 STRM 助手与定时同步任务
+        """
+        if not self._strm_enabled:
+            logger.info("【123多盘】STRM 功能未启用")
+            return
+        self._strm = StrmHelper(
+            api=self._api,
+            moviepilot_address=self._moviepilot_address,
+            media_exts=DEFAULT_MEDIA_EXTS,
+        )
+        if self._full_sync_paths and self._full_sync_cron:
+            try:
+                trigger = CronTrigger.from_crontab(self._full_sync_cron)
+                self._scheduler = BackgroundScheduler(
+                    timezone=settings.TZ
+                )
+                self._scheduler.add_job(
+                    func=self._scheduled_strm_sync,
+                    trigger=trigger,
+                    id="p123diskmulti_strm_sync",
+                    name="123多盘全量同步STRM",
+                    max_instances=1,
+                    coalesce=True,
+                )
+                self._scheduler.start()
+                logger.info(
+                    f"【123多盘】STRM 定时全量同步已启动: {self._full_sync_cron}"
+                )
+            except Exception as e:
+                logger.error(f"【123多盘】STRM 定时任务启动失败: {e}")
+                self._scheduler = None
+
+    def _scheduled_strm_sync(self):
+        """
+        定时全量同步 STRM
+        """
+        if not self._strm:
+            return
+        try:
+            result = self._strm.full_sync(
+                self._full_sync_paths or "",
+                overwrite=self._full_sync_overwrite,
+            )
+            if result.get("paths") and self._refresh_mediaserver:
+                self._refresh_emby(result["paths"])
+        except Exception as e:
+            logger.error(f"【123多盘】定时全量同步 STRM 失败: {e}")
 
     @staticmethod
     def _parse_disks(config: dict) -> List[DiskAccount]:
@@ -215,6 +294,22 @@ class P123DiskMulti(_PluginBase):
                 "methods": ["POST"],
                 "summary": "一键均衡各网盘空间",
                 "description": "将空间紧张网盘中的文件自动移动到剩余空间最大的网盘",
+            },
+            {
+                "path": "/redirect_url",
+                "endpoint": self.api_redirect_url,
+                "auth": "apikey",
+                "methods": ["GET"],
+                "summary": "123云盘302跳转（STRM播放）",
+                "description": "根据文件标识实时换取 123 下载地址并 302 重定向，供 Emby 播放 STRM 使用",
+            },
+            {
+                "path": "/strm_sync",
+                "endpoint": self.api_strm_sync,
+                "auth": "bear",
+                "methods": ["POST"],
+                "summary": "全量同步生成STRM",
+                "description": "扫描所有网盘的媒体目录，批量生成 STRM 文件到本地",
             },
         ]
 
@@ -361,6 +456,197 @@ class P123DiskMulti(_PluginBase):
                                     }
                                 ],
                             },
+                            # STRM 功能
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12},
+                                "content": [
+                                    {
+                                        "component": "VDivider",
+                                        "props": {"class": "my-2"},
+                                    }
+                                ],
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12},
+                                "content": [
+                                    {
+                                        "component": "div",
+                                        "props": {
+                                            "class": "text-subtitle-1 font-weight-bold mb-1"
+                                        },
+                                        "text": "🎬 STRM 功能（多盘支持）",
+                                    }
+                                ],
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 4},
+                                "content": [
+                                    {
+                                        "component": "VSwitch",
+                                        "props": {
+                                            "model": "strm_enabled",
+                                            "label": "启用 STRM 功能",
+                                            "color": "primary",
+                                            "hint": "生成 STRM 文件并支持 302 直链播放（所有网盘通用）",
+                                            "persistent-hint": True,
+                                        },
+                                    }
+                                ],
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 8},
+                                "content": [
+                                    {
+                                        "component": "VTextField",
+                                        "props": {
+                                            "model": "moviepilot_address",
+                                            "label": "MoviePilot 访问地址",
+                                            "placeholder": "http://192.168.1.10:3000",
+                                            "hint": "STRM 播放 URL 前缀，需能被 Emby 访问到（带端口）",
+                                            "persistent-hint": True,
+                                        },
+                                    }
+                                ],
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12},
+                                "content": [
+                                    {
+                                        "component": "VTextarea",
+                                        "props": {
+                                            "model": "transfer_monitor_paths",
+                                            "rows": 3,
+                                            "label": "整理事件监控目录",
+                                            "placeholder": "本地STRM目录#网盘媒体库目录\n例如：\n/volume1/strm/movies#/盘A/电影\n/volume1/strm/tv#/盘B/剧集",
+                                            "hint": "监控 MoviePilot 整理入库事件，自动在本地生成 STRM 文件；网盘目录需带盘前缀",
+                                            "persistent-hint": True,
+                                        },
+                                    }
+                                ],
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12},
+                                "content": [
+                                    {
+                                        "component": "VTextarea",
+                                        "props": {
+                                            "model": "full_sync_paths",
+                                            "rows": 3,
+                                            "label": "全量同步目录",
+                                            "placeholder": "本地STRM目录#网盘媒体库目录\n例如：\n/volume1/strm/movies#/盘A/电影\n/volume1/strm/tv#/盘B/剧集",
+                                            "hint": "全量扫描所有网盘的媒体目录并生成 STRM 文件，可配置多行多盘",
+                                            "persistent-hint": True,
+                                        },
+                                    }
+                                ],
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 4},
+                                "content": [
+                                    {
+                                        "component": "VTextField",
+                                        "props": {
+                                            "model": "full_sync_cron",
+                                            "label": "全量同步定时（cron）",
+                                            "hint": "留空则不自动同步；默认每 7 小时",
+                                            "persistent-hint": True,
+                                        },
+                                    }
+                                ],
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 4},
+                                "content": [
+                                    {
+                                        "component": "VSwitch",
+                                        "props": {
+                                            "model": "full_sync_overwrite",
+                                            "label": "覆盖已有 STRM 文件",
+                                            "color": "primary",
+                                            "hint": "关闭时已存在的 STRM 文件将被跳过",
+                                            "persistent-hint": True,
+                                        },
+                                    }
+                                ],
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 4},
+                                "content": [
+                                    {
+                                        "component": "VSwitch",
+                                        "props": {
+                                            "model": "refresh_mediaserver",
+                                            "label": "生成后刷新媒体服务器",
+                                            "color": "primary",
+                                            "hint": "STRM 生成后自动刷新 Emby 等媒体库",
+                                            "persistent-hint": True,
+                                        },
+                                    }
+                                ],
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12},
+                                "content": [
+                                    {
+                                        "component": "VTextField",
+                                        "props": {
+                                            "model": "mediaserver_names",
+                                            "label": "媒体服务器名称",
+                                            "placeholder": "Emby",
+                                            "hint": "逗号分隔多个，留空则刷新所有媒体服务器",
+                                            "persistent-hint": True,
+                                        },
+                                    }
+                                ],
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12},
+                                "content": [
+                                    {
+                                        "component": "VAlert",
+                                        "props": {
+                                            "type": "info",
+                                            "variant": "tonal",
+                                            "density": "compact",
+                                        },
+                                        "content": [
+                                            {
+                                                "component": "div",
+                                                "props": {
+                                                    "class": "text-subtitle-2 font-weight-bold mb-1"
+                                                },
+                                                "text": "💡 STRM 使用说明",
+                                            },
+                                            {
+                                                "component": "div",
+                                                "props": {"class": "text-caption"},
+                                                "text": "• 在 Emby 中添加本地媒体库指向「本地STRM目录」，播放时自动通过 302 直链从 123 网盘拉流",
+                                            },
+                                            {
+                                                "component": "div",
+                                                "props": {"class": "text-caption"},
+                                                "text": "• STRM URL 形如 /api/v1/plugin/P123DiskMulti/redirect_url?apikey=...&s3_key_flag=...，无需额外配置",
+                                            },
+                                            {
+                                                "component": "div",
+                                                "props": {"class": "text-caption"},
+                                                "text": "• 全量同步适合存量文件，整理事件监控适合新入库文件，两者可同时开启",
+                                            },
+                                        ],
+                                    }
+                                ],
+                            },
                             # 注意事项
                             {
                                 "component": "VCol",
@@ -409,6 +695,15 @@ class P123DiskMulti(_PluginBase):
             "auto_switch": True,
             "reserve_size": 10,
             "disks_text": "",
+            # STRM 功能默认配置
+            "strm_enabled": False,
+            "moviepilot_address": "",
+            "transfer_monitor_paths": "",
+            "full_sync_paths": "",
+            "full_sync_cron": "0 */7 * * *",
+            "full_sync_overwrite": False,
+            "refresh_mediaserver": False,
+            "mediaserver_names": "",
         }
 
     def get_page(self) -> List[dict]:
@@ -612,6 +907,93 @@ class P123DiskMulti(_PluginBase):
                 }
             )
         content[0]["content"].extend(disk_cards)
+
+        # STRM 功能卡片
+        if self._strm_enabled:
+            strm_status_lines = []
+            monitor_count = len(
+                [l for l in (self._transfer_monitor_paths or "").splitlines() if l.strip()]
+            )
+            sync_count = len(
+                [l for l in (self._full_sync_paths or "").splitlines() if l.strip()]
+            )
+            strm_status_lines.append(
+                {
+                    "component": "div",
+                    "props": {"class": "text-caption"},
+                    "text": f"• 整理事件监控：{'已启用' if monitor_count else '未配置'}（{monitor_count} 条路径映射）",
+                }
+            )
+            strm_status_lines.append(
+                {
+                    "component": "div",
+                    "props": {"class": "text-caption"},
+                    "text": f"• 全量同步：{'已配置' if sync_count else '未配置'}（{sync_count} 条路径映射）"
+                    f"{'，定时 ' + self._full_sync_cron if self._full_sync_cron else ''}",
+                }
+            )
+            strm_status_lines.append(
+                {
+                    "component": "div",
+                    "props": {"class": "text-caption"},
+                    "text": f"• MoviePilot 地址：{self._moviepilot_address or '未配置（无法生成 STRM URL）'}",
+                }
+            )
+            content[0]["content"].append(
+                {
+                    "component": "VCol",
+                    "props": {"cols": 12},
+                    "content": [
+                        {
+                            "component": "VCard",
+                            "props": {"variant": "tonal"},
+                            "content": [
+                                {
+                                    "component": "VCardText",
+                                    "content": [
+                                        {
+                                            "component": "div",
+                                            "content": [
+                                                {
+                                                    "component": "span",
+                                                    "props": {
+                                                        "class": "text-subtitle-1 font-weight-bold"
+                                                    },
+                                                    "text": "🎬 STRM 功能",
+                                                },
+                                                {
+                                                    "component": "VBtn",
+                                                    "props": {
+                                                        "color": "primary",
+                                                        "variant": "tonal",
+                                                        "size": "small",
+                                                        "class": "ml-2",
+                                                        "prepend-icon": "mdi-lightning-bolt",
+                                                    },
+                                                    "text": "立即全量同步",
+                                                    "events": {
+                                                        "click": {
+                                                            "api": "plugin/P123DiskMulti/strm_sync",
+                                                            "method": "post",
+                                                        },
+                                                    },
+                                                },
+                                            ],
+                                        },
+                                        {
+                                            "component": "div",
+                                            "props": {
+                                                "class": "mt-2"
+                                            },
+                                            "content": strm_status_lines,
+                                        },
+                                    ],
+                                }
+                            ],
+                        }
+                    ],
+                }
+            )
         return content
 
     def get_module(self) -> Dict[str, Any]:
@@ -647,6 +1029,37 @@ class P123DiskMulti(_PluginBase):
         if event_data.storage == self._disk_name:
             # 处理云盘的操作
             event_data.storage_oper = self._api  # noqa
+
+    @eventmanager.register(EventType.TransferComplete)
+    def strm_transfer_complete(self, event: Event):
+        """
+        监听整理完成事件，为入库文件生成 STRM（多盘支持）
+        """
+        if not self._enabled or not self._strm:
+            return
+        if not self._transfer_monitor_paths:
+            return
+        item = event.event_data
+        if not item:
+            return
+        try:
+            transferinfo = item.get("transferinfo")
+            target_item = getattr(transferinfo, "target_item", None)
+            if not target_item or target_item.storage != self._disk_name:
+                return
+            target_diritem = getattr(transferinfo, "target_diritem", None)
+            target_diritem_path = (
+                target_diritem.path if target_diritem else ""
+            )
+            strm_path = self._strm.handle_transfer_complete(
+                target_item=target_item,
+                target_diritem_path=target_diritem_path,
+                paths_text=self._transfer_monitor_paths,
+            )
+            if strm_path and self._refresh_mediaserver:
+                self._refresh_emby([str(strm_path)])
+        except Exception as e:
+            logger.error(f"【123多盘】整理完成 STRM 生成失败: {e}")
 
     # ==================== 模块方法 ====================
 
@@ -857,8 +1270,108 @@ class P123DiskMulti(_PluginBase):
         except Exception as e:
             return {"success": False, "message": f"均衡失败: {e}"}
 
+    def api_redirect_url(self, request: Request):
+        """
+        123云盘302跳转（STRM 播放端点）
+
+        GET /redirect_url?name=&size=&md5=&s3_key_flag=&disk=
+        """
+        if not self._strm:
+            return JSONResponse(
+                {"state": False, "message": "STRM 功能未启用"}, status_code=500
+            )
+        name = request.query_params.get("name", "")
+        md5 = request.query_params.get("md5", "")
+        disk = request.query_params.get("disk", "")
+        try:
+            size = int(request.query_params.get("size") or 0)
+        except ValueError:
+            size = 0
+        s3_key_flag = request.query_params.get("s3_key_flag", "")
+        user_agent = request.headers.get("User-Agent") or ""
+        url = self._strm.resolve_download_url(
+            name=name,
+            size=size,
+            md5=md5,
+            s3_key_flag=s3_key_flag,
+            user_agent=user_agent,
+            disk_name=disk,
+        )
+        if not url:
+            return JSONResponse(
+                {"state": False, "message": "获取下载地址失败"}, status_code=500
+            )
+        return RedirectResponse(url, 302)
+
+    def api_strm_sync(self) -> Dict[str, Any]:
+        """
+        全量同步生成 STRM（扫描所有网盘）
+        """
+        if not self._strm:
+            return {"success": False, "message": "STRM 功能未启用"}
+        try:
+            result = self._strm.full_sync(
+                self._full_sync_paths or "",
+                overwrite=self._full_sync_overwrite,
+            )
+            if result.get("paths") and self._refresh_mediaserver:
+                self._refresh_emby(result["paths"])
+            result["success"] = True
+            return result
+        except Exception as e:
+            return {"success": False, "message": f"全量同步失败: {e}"}
+
+    def _refresh_emby(self, paths: List[str]):
+        """
+        刷新媒体服务器媒体库（批量，失败仅记录日志）
+
+        :param paths: 需要刷新的 STRM 文件/目录路径列表
+        """
+        if not paths:
+            return
+        try:
+            names = [
+                item.strip()
+                for item in str(self._mediaserver_names or "").split(",")
+                if item.strip()
+            ]
+            services = MediaServerHelper().get_services(
+                name_filters=names or None
+            )
+            if not services:
+                logger.warning("【123多盘】未找到可用的媒体服务器，跳过刷新")
+                return
+            refresh_items = []
+            for path in dict.fromkeys(str(p) for p in paths):
+                try:
+                    refresh_items.append(
+                        RefreshMediaItem(target_path=Path(path))
+                    )
+                except Exception:
+                    continue
+            if not refresh_items:
+                return
+            for service in services.values():
+                try:
+                    instance = getattr(service, "instance", service)
+                    if hasattr(instance, "refresh_library_by_items"):
+                        instance.refresh_library_by_items(refresh_items)
+                    elif hasattr(instance, "refresh_library"):
+                        instance.refresh_library()
+                except Exception as e:
+                    logger.warning(f"【123多盘】刷新媒体服务器失败: {e}")
+        except Exception as e:
+            logger.warning(f"【123多盘】获取媒体服务器服务失败: {e}")
+
     def stop_service(self):
         """
         退出插件
         """
+        if self._scheduler:
+            try:
+                self._scheduler.shutdown(wait=False)
+            except Exception:
+                pass
+            self._scheduler = None
+        self._strm = None
         self._api = None

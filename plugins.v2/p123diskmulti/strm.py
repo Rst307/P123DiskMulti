@@ -1,0 +1,477 @@
+"""
+P123DiskMulti STRM 助手模块（多盘）
+
+职责：
+1. 302 播放端点支撑：S3KeyFlag -> DownloadUrl 实时换取
+   （S3KeyFlag 是 123 全局文件标识，任意账号登录后均可换取，天然支持多盘）
+2. 全量同步：递归扫描【所有网盘】媒体目录，批量生成 STRM 文件到本地
+3. 监控整理：MoviePilot 转移完成后为入库文件生成 STRM
+
+设计原则（可维护 / 可扩展）：
+- 只依赖 P123MultiApi（存储层）与 MoviePilot 基础设施，不依赖插件主类
+- 文件信息统一取自 FileItem.pickcode（123 原始数据：FileName/Size/Etag/S3KeyFlag）
+- 路径映射格式与 p123strmhelper 一致：本地STRM目录#网盘媒体库目录（每行一条）
+- 新增能力（分享 STRM / 媒体信息下载 / 字幕伴随文件）只需在此模块添加方法
+"""
+
+import ast
+import threading
+from pathlib import Path, PurePosixPath
+from typing import Dict, Iterable, List, Optional, Tuple
+from urllib.parse import quote
+
+from p123client import check_response
+
+from app.log import logger
+from app.schemas import FileItem
+
+# 默认媒体扩展名（与 p123strmhelper 保持一致）
+DEFAULT_MEDIA_EXTS = [
+    "mp4", "mkv", "ts", "iso", "rmvb", "avi", "mov",
+    "mpeg", "mpg", "wmv", "3gp", "asf", "m4v", "flv",
+    "m2ts", "tp", "f4v",
+]
+# 蓝光原盘目录名（全量同步时跳过，不生成 STRM）
+BLURAY_DIR_NAMES = {"BDMV", "CERTIFICATE"}
+# 秒传转存兜底目录名（无 S3KeyFlag 时使用，兼容旧版 STRM URL）
+FAST_TRANSFER_DIR = "我的秒传"
+# 默认 User-Agent（302 换取下载地址时使用）
+DEFAULT_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+)
+
+
+class StrmHelper:
+    """
+    123云盘多盘 STRM 助手
+
+    :param api: P123MultiApi 实例（多盘合并存储层）
+    :param moviepilot_address: MoviePilot 对外访问地址（STRM URL 前缀）
+    :param media_exts: 视为媒体的扩展名列表（不含点）
+    """
+
+    def __init__(
+        self,
+        api,
+        moviepilot_address: str = "",
+        media_exts: Optional[List[str]] = None,
+    ):
+        self._api = api
+        self._moviepilot_address = str(moviepilot_address or "").rstrip("/")
+        self._media_exts = set(
+            ext.strip().lower().lstrip(".")
+            for ext in (media_exts or DEFAULT_MEDIA_EXTS)
+            if ext.strip()
+        )
+        # 全量同步防重入锁
+        self._sync_lock = threading.Lock()
+
+    # ==================== URL 构建与换取 ====================
+
+    def build_strm_url(
+        self,
+        name: str,
+        size: int,
+        md5: str,
+        s3_key_flag: str,
+        disk_name: str = "",
+    ) -> Optional[str]:
+        """
+        构建 STRM 播放 URL（302 端点地址 + 文件参数）
+
+        :param name: 文件名
+        :param size: 文件大小（字节）
+        :param md5: 文件 MD5（Etag）
+        :param s3_key_flag: 123 文件标识
+        :param disk_name: 所在网盘名称（用于 302 时优先使用该盘账号换取，可选）
+        :return: STRM URL，未配置 MoviePilot 地址时返回 None
+        """
+        if not self._moviepilot_address:
+            logger.error(
+                "【123多盘STRM】未配置 MoviePilot 访问地址，无法生成 STRM URL"
+            )
+            return None
+        from app.core.config import settings
+
+        url = (
+            f"{self._moviepilot_address}/api/v1/plugin/P123DiskMulti/redirect_url"
+            f"?apikey={quote(settings.API_TOKEN)}"
+            f"&name={quote(name)}&size={int(size)}&md5={quote(md5)}"
+            f"&s3_key_flag={quote(s3_key_flag)}"
+        )
+        if disk_name:
+            url += f"&disk={quote(disk_name)}"
+        return url
+
+    def resolve_download_url(
+        self,
+        name: str,
+        size: int,
+        md5: str,
+        s3_key_flag: str,
+        user_agent: str = "",
+        disk_name: str = "",
+    ) -> Optional[str]:
+        """
+        换取 123 实时下载地址（302 端点核心）
+
+        优先使用文件所在网盘的账号换取；带 S3KeyFlag 时直接换取，
+        无 S3KeyFlag（兼容旧版 STRM URL）时先秒传转存获取标识再换取。
+
+        :return: 下载地址，失败返回 None
+        """
+        account = self._pick_account(disk_name)
+        if not account:
+            logger.error("【123多盘STRM】没有可用的网盘账号，无法换取下载地址")
+            return None
+        client = account.client
+        try:
+            # 无文件标识时：秒传转存兜底（虚拟转存，不消耗空间）
+            if not s3_key_flag:
+                if not md5 or not size:
+                    logger.error("【123多盘STRM】缺少文件标识且缺少 md5/size，无法换取下载地址")
+                    return None
+                resp = client.fs_mkdir(FAST_TRANSFER_DIR)
+                check_response(resp)
+                resp = client.upload_file_fast(
+                    file_md5=md5,
+                    file_name=f"{md5}-{size}",
+                    file_size=int(size),
+                    parent_id=resp["data"]["Info"]["FileId"],
+                    duplicate=2,
+                )
+                check_response(resp)
+                s3_key_flag = resp["data"]["Info"]["S3KeyFlag"]
+                logger.debug(
+                    f"【123多盘STRM】秒传转存成功，获取 S3KeyFlag: {s3_key_flag}"
+                )
+            # 换取下载地址
+            resp = client.download_info(
+                {
+                    "S3KeyFlag": s3_key_flag,
+                    "FileName": name,
+                    "Etag": md5,
+                    "Size": int(size or 0),
+                },
+                base_url="",
+                async_=False,
+                headers={"User-Agent": user_agent or DEFAULT_UA},
+            )
+            check_response(resp)
+            url = resp.get("data", {}).get("DownloadUrl")
+            if not url:
+                logger.error("【123多盘STRM】换取下载地址失败，返回数据缺少 DownloadUrl")
+                return None
+            logger.debug(f"【123多盘STRM】获取下载地址成功: {url}")
+            return url
+        except Exception as e:
+            logger.error(f"【123多盘STRM】获取下载地址失败: {e}")
+            return None
+
+    def _pick_account(self, disk_name: str = ""):
+        """
+        选择用于换取下载地址的网盘账号
+
+        :param disk_name: 优先匹配的网盘名称（空则取第一个可用账号）
+        """
+        accounts = getattr(self._api, "_accounts", []) or []
+        if not accounts:
+            return None
+        if disk_name:
+            for acc in accounts:
+                if acc.name == disk_name:
+                    return acc
+            logger.warn(f"【123多盘STRM】未找到网盘 {disk_name}，使用默认账号")
+        return accounts[0]
+
+    # ==================== 全量同步 ====================
+
+    def full_sync(
+        self, paths_text: str, overwrite: bool = False
+    ) -> Dict:
+        """
+        全量扫描配置的网盘目录并生成 STRM 文件
+
+        :param paths_text: 路径映射配置，每行「本地STRM目录#网盘媒体库目录」
+        :param overwrite: True 覆盖已存在的 STRM 文件
+        :return: 统计结果 {"ok": n, "skip": n, "fail": n, "errors": [...], "paths": [...]}
+        """
+        result: Dict = {"ok": 0, "skip": 0, "fail": 0, "errors": [], "paths": []}
+        mappings = self.parse_mappings(paths_text)
+        if not mappings:
+            result["errors"].append("未配置全量同步目录")
+            return result
+        if not self._sync_lock.acquire(blocking=False):
+            result["errors"].append("已有全量同步任务正在进行，请稍后再试")
+            return result
+        try:
+            for local_dir, pan_dir in mappings:
+                root = self._api.get_item(Path(pan_dir))
+                if not root or root.type != "dir":
+                    result["fail"] += 1
+                    result["errors"].append(f"网盘目录不存在或不可访问: {pan_dir}")
+                    continue
+                logger.info(f"【123多盘STRM】开始全量同步: {pan_dir} -> {local_dir}")
+                try:
+                    for item in self._walk_files(root):
+                        if not self.is_media_file(item.name):
+                            continue
+                        rel_path = self._relative_path(item.path, pan_dir)
+                        if not rel_path:
+                            continue
+                        strm_path = (
+                            Path(local_dir)
+                            / rel_path.parent
+                            / (rel_path.stem + ".strm")
+                        )
+                        if strm_path.exists() and not overwrite:
+                            result["skip"] += 1
+                            continue
+                        info = self._extract_file_info(item)
+                        if not info:
+                            result["fail"] += 1
+                            result["errors"].append(f"文件信息缺失: {item.path}")
+                            continue
+                        url = self.build_strm_url(
+                            name=info["name"],
+                            size=info["size"],
+                            md5=info["md5"],
+                            s3_key_flag=info["s3_key_flag"],
+                            disk_name=self._disk_of(item.path),
+                        )
+                        if not url:
+                            result["fail"] += 1
+                            break
+                        if self._write_strm(strm_path, url):
+                            result["ok"] += 1
+                            result["paths"].append(str(strm_path))
+                        else:
+                            result["fail"] += 1
+                            result["errors"].append(f"写入失败: {strm_path}")
+                except Exception as e:
+                    result["fail"] += 1
+                    result["errors"].append(f"同步 {pan_dir} 失败: {e}")
+            logger.info(
+                f"【123多盘STRM】全量同步完成: 生成 {result['ok']} 个，"
+                f"跳过 {result['skip']} 个，失败 {result['fail']} 个"
+            )
+            return result
+        finally:
+            self._sync_lock.release()
+
+    def _walk_files(self, dir_item: FileItem) -> Iterable[FileItem]:
+        """
+        递归遍历目录，产出所有媒体文件（跳过蓝光原盘结构目录）
+
+        :param dir_item: 起始目录项
+        """
+        try:
+            children = self._api.list(dir_item) or []
+        except Exception as e:
+            logger.warn(f"【123多盘STRM】列出目录失败 {dir_item.path}: {e}")
+            return
+        for child in children:
+            if child.type == "dir":
+                if child.name.upper() in BLURAY_DIR_NAMES:
+                    continue
+                yield from self._walk_files(child)
+            elif child.type == "file":
+                yield child
+
+    # ==================== 监控整理 ====================
+
+    def handle_transfer_complete(
+        self,
+        target_item: FileItem,
+        target_diritem_path: str,
+        paths_text: str,
+    ) -> Optional[Path]:
+        """
+        处理 MoviePilot 转移完成事件，为入库文件生成 STRM
+
+        :param target_item: 转移后的目标文件项（须含 pickcode）
+        :param target_diritem_path: 转移目标目录路径
+        :param paths_text: 路径映射配置（本地STRM目录#网盘媒体库目录）
+        :return: 生成的 STRM 文件路径，未生成返回 None
+        """
+        if not target_item or not target_item.path:
+            return None
+        # 仅处理媒体文件
+        if not self.is_media_file(target_item.name or ""):
+            return None
+        info = self._extract_file_info(target_item)
+        if not info:
+            logger.warn(
+                f"【123多盘STRM】{target_item.path} 缺少网盘文件信息，无法生成 STRM"
+            )
+            return None
+        # 蓝光原盘不支持 STRM
+        if self._is_bluray_dir(target_diritem_path):
+            logger.warning(
+                f"【123多盘STRM】{target_item.path} 为蓝光原盘目录，跳过"
+            )
+            return None
+        # 匹配本地目录映射
+        local_dir, pan_dir = self.match_media_path(
+            target_item.path, self.parse_mappings(paths_text)
+        )
+        if not local_dir:
+            logger.debug(
+                f"【123多盘STRM】{target_item.path} 未匹配到 STRM 输出目录，跳过"
+            )
+            return None
+        rel_path = self._relative_path(target_item.path, pan_dir)
+        if not rel_path:
+            return None
+        strm_path = Path(local_dir) / rel_path.parent / (rel_path.stem + ".strm")
+        url = self.build_strm_url(
+            name=info["name"],
+            size=info["size"],
+            md5=info["md5"],
+            s3_key_flag=info["s3_key_flag"],
+            disk_name=self._disk_of(target_item.path),
+        )
+        if not url:
+            return None
+        if self._write_strm(strm_path, url):
+            logger.info(f"【123多盘STRM】生成 STRM 文件: {strm_path}")
+            return strm_path
+        return None
+
+    @staticmethod
+    def _is_bluray_dir(dir_path: str) -> bool:
+        """
+        判断目录是否为蓝光原盘结构（目录名或上级目录名为 BDMV/CERTIFICATE 等）
+        """
+        if not dir_path:
+            return False
+        name = Path(str(dir_path).replace("\\", "/")).name.upper()
+        return name in BLURAY_DIR_NAMES
+
+    # ==================== 路径匹配 ====================
+
+    @staticmethod
+    def parse_mappings(text: str) -> List[Tuple[str, str]]:
+        """
+        解析路径映射配置：每行「本地STRM目录#网盘媒体库目录」
+
+        :param text: 配置文本（可多行）
+        :return: [(本地目录, 网盘目录), ...]
+        """
+        mappings: List[Tuple[str, str]] = []
+        for line in str(text or "").splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if "#" not in line:
+                logger.warn(f"【123多盘STRM】忽略无效路径映射行: {line}")
+                continue
+            local_dir, _, pan_dir = line.partition("#")
+            local_dir = local_dir.strip().strip("'\"")
+            pan_dir = pan_dir.strip().strip("'\"")
+            if not local_dir or not pan_dir:
+                logger.warn(f"【123多盘STRM】忽略无效路径映射行: {line}")
+                continue
+            mappings.append((local_dir, pan_dir))
+        return mappings
+
+    @classmethod
+    def match_media_path(
+        cls, path: str, mappings: List[Tuple[str, str]]
+    ) -> Tuple[Optional[str], Optional[str]]:
+        """
+        匹配路径对应的本地输出目录与网盘目录
+
+        :param path: 网盘文件路径（带盘前缀）
+        :param mappings: parse_mappings 结果
+        :return: (本地目录, 网盘目录)，未匹配返回 (None, None)
+        """
+        norm = str(path).replace("\\", "/").rstrip("/")
+        best: Optional[Tuple[str, str]] = None
+        for local_dir, pan_dir in mappings:
+            pan_norm = str(pan_dir).replace("\\", "/").rstrip("/")
+            if not pan_norm:
+                continue
+            if norm == pan_norm or norm.startswith(pan_norm + "/"):
+                # 取最长的匹配前缀（配置多个嵌套目录时精确匹配）
+                if best is None or len(pan_norm) > len(best[1]):
+                    best = (local_dir, pan_dir)
+        if best:
+            return best
+        return None, None
+
+    # ==================== 文件工具 ====================
+
+    @staticmethod
+    def _extract_file_info(fileitem: FileItem) -> Optional[Dict]:
+        """
+        从 FileItem.pickcode 提取 123 原始文件信息
+
+        :return: {"name", "size", "md5", "s3_key_flag"}，缺失返回 None
+        """
+        if not fileitem or not fileitem.pickcode:
+            return None
+        try:
+            data = ast.literal_eval(fileitem.pickcode)
+        except Exception:
+            return None
+        if not isinstance(data, dict):
+            return None
+        name = data.get("FileName") or fileitem.name
+        size = data.get("Size")
+        md5 = data.get("Etag")
+        s3_key_flag = data.get("S3KeyFlag")
+        if not name or size is None or not md5 or not s3_key_flag:
+            return None
+        return {
+            "name": name,
+            "size": int(size),
+            "md5": md5,
+            "s3_key_flag": s3_key_flag,
+        }
+
+    @classmethod
+    def _relative_path(
+        cls, path: str, base: str
+    ) -> Optional[PurePosixPath]:
+        """
+        计算网盘路径相对于映射目录的相对路径
+        """
+        try:
+            return PurePosixPath(str(path).replace("\\", "/")).relative_to(
+                PurePosixPath(str(base).replace("\\", "/").rstrip("/"))
+            )
+        except ValueError:
+            return None
+
+    @classmethod
+    def _disk_of(cls, path: str) -> str:
+        """
+        从虚拟路径提取网盘名称（首段）
+        """
+        parts = str(path).replace("\\", "/").strip("/").split("/", 1)
+        return parts[0] if parts and parts[0] else ""
+
+    def is_media_file(self, name: str) -> bool:
+        """
+        判断是否为媒体文件（按扩展名）
+        """
+        if not name:
+            return False
+        ext = Path(name).suffix.lstrip(".").lower()
+        return ext in self._media_exts
+
+    @staticmethod
+    def _write_strm(strm_path: Path, url: str) -> bool:
+        """
+        写入 STRM 文件
+        """
+        try:
+            strm_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(strm_path, "w", encoding="utf-8") as f:
+                f.write(url)
+            return True
+        except Exception as e:
+            logger.error(f"【123多盘STRM】写入 STRM 文件失败 {strm_path}: {e}")
+            return False

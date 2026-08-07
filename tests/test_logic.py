@@ -290,6 +290,18 @@ class FakeP123Client:
             self.file_contents[self.last_upload["FileId"]] = bytes(data)
         return {"code": 0}
 
+    def upload_file_fast(self, file_md5="", file_name="", file_size=-1,
+                         parent_id=0, duplicate=0, **kwargs):
+        """秒传转存：按 md5 创建条目并返回 S3KeyFlag"""
+        e = self._entry(file_name, int(parent_id), "file",
+                        size=max(file_size, 0), etag=file_md5 or "fast-md5")
+        return {"code": 0, "data": {"Info": e}}
+
+    def _has_dir(self, name):
+        """辅助：根目录下是否存在同名目录"""
+        return any(e["FileName"] == name and e["Type"] == 1
+                   for e in self.entries.values() if e["ParentFileId"] == 0)
+
     def upload_complete(self, data):
         # 返回本次上传创建的文件条目
         e = self.last_upload
@@ -297,8 +309,8 @@ class FakeP123Client:
             e = self._entry(data.get("fileName", "f"), data.get("parentFileId", 0), "file")
         return {"code": 0, "data": {"file_info": e}}
 
-    def download_info(self, payload):
-        self.pending_download_file_id = int(payload["FileID"])
+    def download_info(self, payload, base_url="", async_=False, **kwargs):
+        self.pending_download_file_id = int(payload.get("FileID", 0) or 0)
         return {"code": 0, "data": {"DownloadUrl": "http://download/1"}}
 
 
