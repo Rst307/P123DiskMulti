@@ -18,6 +18,7 @@ from app.schemas import FileItem, RefreshMediaItem, StorageOperSelectionEventDat
 from app.schemas.types import ChainEventType, EventType
 from app.utils.string import StringUtils
 
+from .organize import DEFAULT_ORGANIZE_CRON, OrganizeRunner
 from .p123_api import DiskAccount, P123MultiApi
 from .share import ShareSync
 from .strm import DEFAULT_MEDIA_EXTS, StrmHelper
@@ -43,7 +44,7 @@ class P123DiskMulti(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/DDSRem-Dev/MoviePilot-Plugins/main/icons/P123Disk.png"
     # 插件版本
-    plugin_version = "1.3.4"
+    plugin_version = "1.4.0"
     # 插件作者
     plugin_author = "Rst307"
     # 作者主页
@@ -70,6 +71,8 @@ class P123DiskMulti(_PluginBase):
         self._scheduler: Optional[BackgroundScheduler] = None
         # 分享增量同步任务
         self._shares: List[ShareSync] = []
+        # 定期目录整理（调用 MoviePilot 整理链）
+        self._organize: Optional[OrganizeRunner] = None
 
     def init_plugin(self, config: dict = None):
         """
@@ -77,6 +80,7 @@ class P123DiskMulti(_PluginBase):
         """
         self._api = None
         self._strm = None
+        self._organize = None
         self.stop_service()
         if config:
             self._enabled = config.get("enabled", False)
@@ -104,6 +108,11 @@ class P123DiskMulti(_PluginBase):
             self._share_enabled = config.get("share_enabled", False)
             self._shares_text = config.get("shares_text") or ""
             self._share_cron = config.get("share_cron") or DEFAULT_SHARE_CRON
+
+            # 定期目录整理配置
+            self._organize_enabled = config.get("organize_enabled", False)
+            self._organize_paths = config.get("organize_paths") or ""
+            self._organize_cron = config.get("organize_cron") or DEFAULT_ORGANIZE_CRON
 
             # 解析网盘账号列表
             accounts = self._parse_disks(config)
@@ -134,6 +143,8 @@ class P123DiskMulti(_PluginBase):
                     self._init_strm()
                     # 初始化分享增量同步
                     self._init_shares()
+                    # 初始化定期目录整理
+                    self._init_organize()
                 else:
                     logger.warn("【123多盘】未配置任何网盘账号，请填写网盘账号列表")
             else:
@@ -186,6 +197,44 @@ class P123DiskMulti(_PluginBase):
         )
         if not started:
             logger.info("【123多盘】定时同步触发时已有同步任务在运行，跳过本次")
+
+    def _init_organize(self):
+        """
+        初始化定期目录整理与定时任务
+        """
+        if not self._organize_enabled:
+            logger.info("【123多盘】定期目录整理未启用")
+            return
+        self._organize = OrganizeRunner(api=self._api)
+        if self._organize_paths and self._organize_cron:
+            try:
+                trigger = CronTrigger.from_crontab(self._organize_cron)
+                if not self._scheduler:
+                    self._scheduler = BackgroundScheduler(timezone=settings.TZ)
+                    self._scheduler.start()
+                self._scheduler.add_job(
+                    func=self._scheduled_organize,
+                    trigger=trigger,
+                    id="p123diskmulti_organize",
+                    name="123多盘定期目录整理",
+                    max_instances=1,
+                    coalesce=True,
+                )
+                logger.info(
+                    f"【123多盘】定期目录整理已启动: {self._organize_cron}"
+                )
+            except Exception as e:
+                logger.error(f"【123多盘】定期整理定时任务启动失败: {e}")
+
+    def _scheduled_organize(self):
+        """
+        定时目录整理（后台执行，不与手动整理并发）
+        """
+        if not self._organize:
+            return
+        started = self._organize.start_organize(self._organize_paths or "")
+        if not started:
+            logger.info("【123多盘】定时整理触发时已有整理任务在运行，跳过本次")
 
     def _init_shares(self):
         """
@@ -510,6 +559,22 @@ class P123DiskMulti(_PluginBase):
                 "methods": ["GET"],
                 "summary": "查询分享任务状态",
                 "description": "返回所有分享任务的运行状态、已转存数量与上次结果",
+            },
+            {
+                "path": "/organize",
+                "endpoint": self.api_organize,
+                "auth": "bear",
+                "methods": ["POST"],
+                "summary": "定期目录整理（后台）",
+                "description": "扫描指定 123 盘目录的媒体文件并提交到 MoviePilot 整理队列，立即返回",
+            },
+            {
+                "path": "/organize_status",
+                "endpoint": self.api_organize_status,
+                "auth": "bear",
+                "methods": ["GET"],
+                "summary": "查询后台目录整理状态",
+                "description": "返回当前是否在整理、上次整理时间与结果",
             },
         ]
 
@@ -987,6 +1052,116 @@ class P123DiskMulti(_PluginBase):
                                     }
                                 ],
                             },
+                            # 定期目录整理
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12},
+                                "content": [
+                                    {
+                                        "component": "VDivider",
+                                        "props": {"class": "my-2"},
+                                    }
+                                ],
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12},
+                                "content": [
+                                    {
+                                        "component": "div",
+                                        "props": {
+                                            "class": "text-subtitle-1 font-weight-bold mb-1"
+                                        },
+                                        "text": "🗂️ 定期目录整理（调用 MoviePilot 整理链）",
+                                    }
+                                ],
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 4},
+                                "content": [
+                                    {
+                                        "component": "VSwitch",
+                                        "props": {
+                                            "model": "organize_enabled",
+                                            "label": "启用定期目录整理",
+                                            "color": "primary",
+                                            "hint": "定期将指定 123 盘目录内的媒体文件提交到 MoviePilot 整理队列（重命名/刮削/进媒体库）",
+                                            "persistent-hint": True,
+                                        },
+                                    }
+                                ],
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 8},
+                                "content": [
+                                    {
+                                        "component": "VTextField",
+                                        "props": {
+                                            "model": "organize_cron",
+                                            "label": "定时整理（cron）",
+                                            "hint": "留空则不自动整理；默认每天凌晨 3 点",
+                                            "persistent-hint": True,
+                                        },
+                                    }
+                                ],
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12},
+                                "content": [
+                                    {
+                                        "component": "VTextarea",
+                                        "props": {
+                                            "model": "organize_paths",
+                                            "rows": 3,
+                                            "label": "整理目录（每行一个）",
+                                            "placeholder": "/盘A/emby_raw\n/rst307/emby_raw\n/盘B/下载/剧集",
+                                            "hint": "需带网盘前缀（如 /盘A/电影）；递归扫描目录内的视频文件并逐个提交整理，字幕等附加文件由 MoviePilot 整理链自动同步",
+                                            "persistent-hint": True,
+                                        },
+                                    }
+                                ],
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12},
+                                "content": [
+                                    {
+                                        "component": "VAlert",
+                                        "props": {
+                                            "type": "info",
+                                            "variant": "tonal",
+                                            "density": "compact",
+                                        },
+                                        "content": [
+                                            {
+                                                "component": "div",
+                                                "props": {
+                                                    "class": "text-subtitle-2 font-weight-bold mb-1"
+                                                },
+                                                "text": "💡 定期整理说明",
+                                            },
+                                            {
+                                                "component": "div",
+                                                "props": {"class": "text-caption"},
+                                                "text": "• 整理完全调用 MoviePilot 自带整理链：重命名、刮削、进媒体库等规则由 MoviePilot 的转移目录/整理配置决定，请在 MoviePilot「目录同步」中为 123 盘目录配置好整理目标",
+                                            },
+                                            {
+                                                "component": "div",
+                                                "props": {"class": "text-caption"},
+                                                "text": "• 文件提交到 MoviePilot 整理队列后台执行（不阻塞插件），已整理过的文件不会被重复整理（MoviePilot 自动去重）",
+                                            },
+                                            {
+                                                "component": "div",
+                                                "props": {"class": "text-caption"},
+                                                "text": "• 同盘移动为 123 服务器端秒级操作；整理完成后 MoviePilot 会自动通知媒体服务器刷新",
+                                            },
+                                        ],
+                                    }
+                                ],
+                            },
                             # 注意事项
                             {
                                 "component": "VCol",
@@ -1048,6 +1223,10 @@ class P123DiskMulti(_PluginBase):
             "share_enabled": False,
             "shares_text": "",
             "share_cron": "0 */6 * * *",
+            # 定期目录整理默认配置
+            "organize_enabled": False,
+            "organize_paths": "",
+            "organize_cron": "0 3 * * *",
         }
 
     def get_page(self) -> List[dict]:
@@ -1498,6 +1677,100 @@ class P123DiskMulti(_PluginBase):
                         ],
                     }
                 )
+
+        # 定期目录整理卡片
+        if self._organize:
+            organize_lines = []
+            path_count = len(
+                [l for l in (self._organize_paths or "").splitlines() if l.strip()]
+            )
+            organize_lines.append(
+                {
+                    "component": "div",
+                    "props": {"class": "text-caption"},
+                    "text": f"• 整理目录：{'已配置 ' + str(path_count) + ' 个' if path_count else '未配置'}"
+                    f"{'，定时 ' + self._organize_cron if self._organize_cron else ''}",
+                }
+            )
+            org_state = self._organize.organize_status()
+            if org_state.get("running"):
+                organize_lines.append(
+                    {
+                        "component": "div",
+                        "props": {"class": "text-caption font-weight-bold"},
+                        "text": "⏳ 正在后台整理，请稍后刷新页面查看结果…",
+                    }
+                )
+            elif org_state.get("last_result") is not None:
+                last = org_state["last_result"]
+                last_time = org_state.get("last_time") or ""
+                errs = len(last.get("errors") or [])
+                last_text = (
+                    f"• 上次整理：{last_time} · 已提交 {last.get('ok', 0)} 个，"
+                    f"失败 {last.get('fail', 0)} 个"
+                )
+                if errs:
+                    last_text += f"（{errs} 条错误）"
+                organize_lines.append(
+                    {
+                        "component": "div",
+                        "props": {"class": "text-caption"},
+                        "text": last_text,
+                    }
+                )
+            content[0]["content"].append(
+                {
+                    "component": "VCol",
+                    "props": {"cols": 12},
+                    "content": [
+                        {
+                            "component": "VCard",
+                            "props": {"variant": "tonal"},
+                            "content": [
+                                {
+                                    "component": "VCardText",
+                                    "content": [
+                                        {
+                                            "component": "div",
+                                            "content": [
+                                                {
+                                                    "component": "span",
+                                                    "props": {
+                                                        "class": "text-subtitle-1 font-weight-bold"
+                                                    },
+                                                    "text": "🗂️ 定期目录整理",
+                                                },
+                                                {
+                                                    "component": "VBtn",
+                                                    "props": {
+                                                        "color": "primary",
+                                                        "variant": "tonal",
+                                                        "size": "small",
+                                                        "class": "ml-2",
+                                                        "prepend-icon": "mdi-folder-cog",
+                                                    },
+                                                    "text": "立即整理",
+                                                    "events": {
+                                                        "click": {
+                                                            "api": "plugin/P123DiskMulti/organize",
+                                                            "method": "post",
+                                                        },
+                                                    },
+                                                },
+                                            ],
+                                        },
+                                        {
+                                            "component": "div",
+                                            "props": {"class": "mt-2"},
+                                            "content": organize_lines,
+                                        },
+                                    ],
+                                }
+                            ],
+                        }
+                    ],
+                }
+            )
         return content
 
     def get_module(self) -> Dict[str, Any]:
@@ -1843,6 +2116,40 @@ class P123DiskMulti(_PluginBase):
         except Exception as e:
             return {"success": False, "message": f"查询同步状态失败: {e}"}
 
+    def api_organize(self) -> Dict[str, Any]:
+        """
+        定期目录整理（后台，立即返回）
+        """
+        if not self._organize:
+            return {"success": False, "message": "定期目录整理未启用（请先在设置中启用并保存）"}
+        try:
+            started = self._organize.start_organize(
+                self._organize_paths or ""
+            )
+        except Exception as e:
+            return {"success": False, "message": f"启动后台整理失败: {e}"}
+        if not started:
+            return {
+                "success": False,
+                "message": "已有整理任务正在进行，请稍后再试",
+            }
+        return {
+            "success": True,
+            "background": True,
+            "message": "已开始后台整理：扫描目录并提交到 MoviePilot 整理队列，请稍后刷新页面查看结果",
+        }
+
+    def api_organize_status(self) -> Dict[str, Any]:
+        """
+        查询后台目录整理状态
+        """
+        if not self._organize:
+            return {"success": False, "message": "定期目录整理未启用"}
+        try:
+            return {"success": True, **self._organize.organize_status()}
+        except Exception as e:
+            return {"success": False, "message": f"查询整理状态失败: {e}"}
+
     def _strm_sync_done(self, result: Dict[str, Any]):
         """
         后台全量同步完成回调（在后台线程中执行）
@@ -2001,4 +2308,5 @@ class P123DiskMulti(_PluginBase):
                 pass
         self._shares = []
         self._strm = None
+        self._organize = None
         self._api = None
