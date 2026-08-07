@@ -1,0 +1,15 @@
+{
+  "P123DiskMulti": {
+    "name": "123云盘多盘合并",
+    "description": "将多个123网盘账号合并为一个存储空间，支持网盘间互传、空间不足自动切换网盘、合并空间显示。",
+    "labels": "云盘",
+    "version": "1.0.0",
+    "icon": "https://raw.githubusercontent.com/DDSRem-Dev/MoviePilot-Plugins/main/icons/P123Disk.png",
+    "author": "Rst307",
+    "system_version": ">=2.15.2",
+    "level": 1,
+    "history": {
+      "v1.0.0": "发布"
+    }
+  }
+}
