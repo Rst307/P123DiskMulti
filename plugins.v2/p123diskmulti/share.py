@@ -254,6 +254,7 @@ class ShareSync:
         confirm_interval: float = DEFAULT_CONFIRM_INTERVAL,
         auto_switch: bool = False,
         reserve_size: int = 0,
+        note: str = "",
     ) -> None:
         self._api = api
         self.task_id = str(task_id)
@@ -276,6 +277,8 @@ class ShareSync:
         # 空间不足自动切换目标网盘（与上传自动切换共用同一套空间判定）
         self._auto_switch = bool(auto_switch)
         self._reserve_size = int(reserve_size or 0)
+        # 用户备注（可选，用于区分多个分享任务对应的剧/链接）
+        self.note = str(note or "").strip()
         self._batch_size = max(1, min(100, int(batch_size)))
         self._confirm_attempts = max(1, int(confirm_attempts))
         self._confirm_interval = max(0.0, float(confirm_interval))
@@ -788,6 +791,7 @@ class ShareSync:
         return {
             "task_id": self.task_id,
             "name": self.name,
+            "note": self.note,
             "enabled": True,
             "share_key": self._mask_share_key(),
             "target_vpath": self.target_vpath,

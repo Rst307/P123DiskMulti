@@ -43,7 +43,7 @@ class P123DiskMulti(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/DDSRem-Dev/MoviePilot-Plugins/main/icons/P123Disk.png"
     # 插件版本
-    plugin_version = "1.3.3"
+    plugin_version = "1.3.4"
     # 插件作者
     plugin_author = "Rst307"
     # 作者主页
@@ -208,6 +208,7 @@ class P123DiskMulti(_PluginBase):
                     db_path=db_path,
                     auto_switch=self._auto_switch,
                     reserve_size=self._reserve_size,
+                    note=conf.get("note") or "",
                 )
                 self._shares.append(task)
                 logger.info(
@@ -254,8 +255,8 @@ class P123DiskMulti(_PluginBase):
         解析分享同步配置
 
         支持两种格式：
-        1. 每行一条：网盘名称,分享链接或分享码,提取码,目标目录（提取码可为空：名称,链接,,目标目录）
-        2. JSON 数组：[{"name":..., "share_key":..., "share_pwd":..., "target_path":...}]
+        1. 每行一条：名称,分享链接或分享码,提取码,目标目录,注释（可选，提取码可为空：名称,链接,,目标目录）
+        2. JSON 数组：[{"name":..., "share_key":..., "share_pwd":..., "target_path":..., "note":...}]
         """
         result: List[Dict[str, Any]] = []
         raw = shares_text
@@ -292,12 +293,19 @@ class P123DiskMulti(_PluginBase):
                 target_path = str(
                     item.get("target_path") or item.get("target") or ""
                 ).strip()
+                note = str(
+                    item.get("note")
+                    or item.get("comment")
+                    or item.get("remark")
+                    or ""
+                ).strip()
             else:
-                parts = [part.strip() for part in str(item).split(",", 3)]
+                parts = [part.strip() for part in str(item).split(",", 4)]
                 if len(parts) < 4:
                     logger.warn(f"【123多盘】忽略无效分享配置行: {item}")
                     continue
-                name, share_key, share_pwd, target_path = parts
+                name, share_key, share_pwd, target_path = parts[:4]
+                note = parts[4] if len(parts) > 4 else ""
             if not name or not share_key or not target_path:
                 logger.warn(f"【123多盘】忽略不完整的分享配置: {item}")
                 continue
@@ -313,6 +321,7 @@ class P123DiskMulti(_PluginBase):
                     "share_key": share_key,
                     "share_pwd": share_pwd,
                     "target_path": target_path.rstrip("/"),
+                    "note": note,
                 }
             )
         return result
@@ -928,8 +937,8 @@ class P123DiskMulti(_PluginBase):
                                             "model": "shares_text",
                                             "rows": 4,
                                             "label": "分享任务列表（每行一个）",
-                                            "placeholder": "名称,分享链接或分享码,提取码,目标目录\n例如：\n电影分享,https://www.123pan.com/s/AbC123-DEF,1234,/盘A/分享/电影\n剧集分享,Sa7K8-QwEr,,/盘B/分享/剧集",
-                                            "hint": "提取码可为空（留空字段）；目标目录必须带网盘前缀，转存时保留分享目录结构，只转存新文件",
+                                            "placeholder": "名称,分享链接或分享码,提取码,目标目录,注释(可选)\n例如：\n东京教父,https://www.123pan.com/s/AbC123-DEF,1234,/盘A/分享/电影,东京教父1080p\n剧集分享,Sa7K8-QwEr,,/盘B/分享/剧集,某某剧第一季",
+                                            "hint": "提取码与注释可为空（字段留空）；目标目录必须带网盘前缀；注释会显示在插件页卡片上，方便区分多个任务对应的剧/链接",
                                             "persistent-hint": True,
                                         },
                                     }
@@ -1373,6 +1382,17 @@ class P123DiskMulti(_PluginBase):
                         "text": f"• 已转存：{st['synced']} 个文件",
                     },
                 ]
+                if st.get("note"):
+                    share_lines.insert(
+                        0,
+                        {
+                            "component": "div",
+                            "props": {
+                                "class": "text-subtitle-2 font-weight-bold"
+                            },
+                            "text": f"📝 {st['note']}",
+                        },
+                    )
                 if st.get("running"):
                     share_lines.append(
                         {

@@ -101,13 +101,16 @@ task = ShareSync(
     api=api, task_id="t1", name="测试分享",
     share_key="https://www.123pan.com/s/AbC123-DEF?pwd=xyz",
     share_pwd="", target_vpath="/盘A/分享", db_path=db_file,
+    note="东京教父1080p",
 )
+check(task.note == "东京教父1080p", "注释参数已保存")
 check(task.share_key == "AbC123-DEF" and "pwd" not in task.share_key, f"URL 分享码已规范化为纯分享码: {task.share_key}")
 result = task.check()
 check(result["success"] is True, "分享可访问")
 check(result["files"] == 3 and result["dirs"] == 3, f"统计正确: {result['files']} 文件 {result['dirs']} 目录")
 check(result["total_size"] == 3010, f"总大小正确: {result['total_size']}")
 check(len(result["root_items"]) == 2, "根目录项 2 个（电影/剧集）")
+check(task.status().get("note") == "东京教父1080p", "状态查询返回注释")
 
 # ============ 3. 首次增量转存 ============
 print("== 3. 首次增量转存 ==")
@@ -219,6 +222,9 @@ try:
     check(False, "无盘前缀目标目录应被拒绝")
 except ValueError:
     check(True, "无盘前缀目标目录被拒绝")
+check(ShareSync(api=api, task_id="nonote", name="无注释", share_key="AbC123-EF",
+                share_pwd="", target_vpath="/盘A/x", db_path=db_file).note == "",
+      "注释可省略（默认空）")
 
 task.close()
 
