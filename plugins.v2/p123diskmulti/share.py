@@ -252,6 +252,8 @@ class ShareSync:
         batch_size: int = DEFAULT_BATCH_SIZE,
         confirm_attempts: int = DEFAULT_CONFIRM_ATTEMPTS,
         confirm_interval: float = DEFAULT_CONFIRM_INTERVAL,
+        auto_switch: bool = False,
+        reserve_size: int = 0,
     ) -> None:
         self._api = api
         self.task_id = str(task_id)
@@ -271,6 +273,9 @@ class ShareSync:
         self.share_pwd = share_pwd
         self.target_vpath = str(target_vpath or "").strip().rstrip("/") or "/"
         self._share_fp = share_fingerprint(str(share_key or "").strip())
+        # 空间不足自动切换目标网盘（与上传自动切换共用同一套空间判定）
+        self._auto_switch = bool(auto_switch)
+        self._reserve_size = int(reserve_size or 0)
         self._batch_size = max(1, min(100, int(batch_size)))
         self._confirm_attempts = max(1, int(confirm_attempts))
         self._confirm_interval = max(0.0, float(confirm_interval))
@@ -306,6 +311,50 @@ class ShareSync:
             if acc.name == first:
                 return acc
         return None
+
+    def _ensure_target_disk(self, need: int) -> bool:
+        """
+        确保目标网盘有足够空间容纳 need 字节（含预留空间）
+
+        空间不足且启用自动切换时，切换到剩余空间最大的可用网盘
+        （同时更新 target_vpath 盘前缀，后续映射/账号/确认自动跟随）；
+        未启用自动切换或所有网盘均不足时返回 False。
+        """
+        api = self._api
+        account = self._target_account()
+        if not account:
+            return False
+        # 强制刷新空间信息（服务器端直传会消耗目标盘空间）
+        try:
+            api._invalidate_usage(account)
+            api._invalidate_usage()
+        except Exception:
+            pass
+        if api._has_space(account, need):
+            return True
+        if not self._auto_switch:
+            logger.warn(
+                f"【123多盘】分享 {self.name} 目标网盘 {account.name} 剩余空间不足"
+                f"（需 {need} 字节），未启用自动切换，本批跳过"
+            )
+            return False
+        alt = api._pick_disk(need, exclude=account)
+        if not alt:
+            logger.error(
+                f"【123多盘】分享 {self.name} 所有网盘剩余空间均不足"
+                f"（需 {need} 字节 + 预留 {self._reserve_size} 字节）"
+            )
+            return False
+        # 切换目标盘前缀（保留原目录结构）
+        parts = self.target_vpath.strip("/").split("/", 1)
+        self.target_vpath = f"/{alt.name}" + (
+            f"/{parts[1]}" if len(parts) > 1 else ""
+        )
+        logger.info(
+            f"【123多盘】分享 {self.name} 目标网盘 {account.name} 空间不足，"
+            f"自动切换到 {alt.name}，后续文件转存至 {self.target_vpath}"
+        )
+        return True
 
     @staticmethod
     def _safe_name(raw: Any) -> str:
@@ -531,25 +580,41 @@ class ShareSync:
                     f"已同步 {result['skipped']} 个）"
                 )
                 return result
-            # 4. 按目标父目录分批转存
-            groups: Dict[str, List[Tuple[ShareFile, str]]] = {}
-            for f, target in plans:
-                groups.setdefault(str(PurePosixPath(target).parent), []).append((f, target))
-            for parent, group in groups.items():
-                parent_item = self._api.get_folder(PurePosixPath(parent))
-                if not parent_item:
-                    result["failed"] += len(group)
-                    result["errors"].append(f"目标目录创建失败: {parent}")
-                    continue
+            # 4. 按目标父目录分批转存（每批前做空间检查，不足自动切换网盘）
+            by_parent: Dict[str, List[ShareFile]] = {}
+            for f, _target in plans:
+                by_parent.setdefault(
+                    str(PurePosixPath(_target).parent), []
+                ).append(f)
+            for _parent, group in by_parent.items():
                 for offset in range(0, len(group), self._batch_size):
-                    chunk = group[offset:offset + self._batch_size]
+                    files = group[offset:offset + self._batch_size]
                     try:
+                        # 空间预检 + 自动切换（切盘后 target_vpath 前缀已更新）
+                        need = sum(f.size or 0 for f in files)
+                        if not self._ensure_target_disk(need):
+                            result["failed"] += len(files)
+                            result["errors"].append(
+                                f"目标网盘剩余空间不足，跳过 {len(files)} 个文件"
+                            )
+                            continue
+                        # 按切盘后的目标路径重新映射并取父目录
+                        targets = [self._map_target(f.path) for f in files]
+                        parent = str(PurePosixPath(targets[0]).parent)
+                        parent_item = self._api.get_folder(PurePosixPath(parent))
+                        if not parent_item:
+                            result["failed"] += len(files)
+                            result["errors"].append(f"目标目录创建失败: {parent}")
+                            continue
+                        chunk = list(zip(files, targets))
                         copied = self._copy_batch(parent_item, chunk)
-                        confirmed, pending = self._confirm_batch(chunk, parent_item, copied)
+                        confirmed, pending = self._confirm_batch(
+                            chunk, parent_item, copied
+                        )
                         result["copied"] += confirmed
                         result["pending"] += pending
                     except Exception as e:
-                        result["failed"] += len(chunk)
+                        result["failed"] += len(files)
                         result["errors"].append(f"转存批次失败: {e}")
             logger.info(
                 f"【123多盘】分享 {self.name} 转存完成：扫描 {result['scanned']}，"

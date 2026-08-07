@@ -43,7 +43,7 @@ class P123DiskMulti(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/DDSRem-Dev/MoviePilot-Plugins/main/icons/P123Disk.png"
     # 插件版本
-    plugin_version = "1.3.0"
+    plugin_version = "1.3.1"
     # 插件作者
     plugin_author = "Rst307"
     # 作者主页
@@ -206,6 +206,8 @@ class P123DiskMulti(_PluginBase):
                     share_pwd=conf["share_pwd"],
                     target_vpath=conf["target_path"],
                     db_path=db_path,
+                    auto_switch=self._auto_switch,
+                    reserve_size=self._reserve_size,
                 )
                 self._shares.append(task)
                 logger.info(
@@ -953,6 +955,11 @@ class P123DiskMulti(_PluginBase):
                                                 "component": "div",
                                                 "props": {"class": "text-caption"},
                                                 "text": "• 已转存文件记录在插件数据目录的 SQLite 中，同名文件增删后不会重复转存",
+                                            },
+                                            {
+                                                "component": "div",
+                                                "props": {"class": "text-caption"},
+                                                "text": "• 转存中目标网盘空间不足（低于预留空间）时，自动切换到剩余空间最大的网盘继续转存（受「空间不足自动切换网盘」总开关控制），无需手动改配置",
                                             },
                                             {
                                                 "component": "div",

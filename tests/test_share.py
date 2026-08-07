@@ -42,11 +42,17 @@ def check(cond, msg):
         print(f"  ❌ {msg}")
 
 
-def build_env():
-    """构造 盘A + 一个分享树（/电影/阿凡达.mkv + /电影/字幕.srt + /剧集/E01.mkv + 子目录）。"""
+def build_env(a_total=100 * 1024 ** 3, a_used=10 * 1024 ** 3,
+              b_total=0, b_used=0):
+    """构造 盘A + 分享树；b_total>0 时额外创建 盘B（切盘测试用）。"""
     api = P123MultiApi(disks=[], disk_name="123云盘")
-    acc_a = make_account("盘A", 100 * 1024 ** 3, 10 * 1024 ** 3)
-    api._accounts = [acc_a]
+    acc_a = make_account("盘A", a_total, a_used)
+    accounts = [acc_a]
+    acc_b = None
+    if b_total > 0:
+        acc_b = make_account("盘B", b_total, b_used)
+        accounts.append(acc_b)
+    api._accounts = accounts
     fake = acc_a.client._fake
     fake.share_entries = {
         0: [
@@ -71,7 +77,6 @@ def build_env():
         ],
     }
     return api, acc_a, fake
-
 
 db_file = Path(tempfile.mkdtemp(prefix="p123share_")) / "test.sqlite3"
 
@@ -211,5 +216,68 @@ except ValueError:
     check(True, "无盘前缀目标目录被拒绝")
 
 task.close()
+
+# ============ 11. 目标盘满自动切换 ============
+print("== 11. 目标盘满自动切换 ==")
+api, acc_a, fake = build_env(a_used=96 * 1024 ** 3, b_total=100 * 1024 ** 3, b_used=10 * 1024 ** 3)
+acc_b = api._accounts[1]
+reserve = 5 * 1024 ** 3
+# 盘A 可用 4GB < 预留 5GB；盘B 可用 90GB
+api._reserve_size = reserve
+api._auto_switch = True
+task = ShareSync(
+    api=api, task_id="t11", name="切盘测试",
+    share_key="ShKey-ABCDEF", share_pwd="",
+    target_vpath="/盘A/分享", db_path=db_file,
+    auto_switch=True, reserve_size=reserve,
+)
+result = task.sync()
+print(f"  (结果: copied={result['copied']} skipped={result['skipped']} failed={result['failed']})")
+check(result["copied"] == 3 and result["failed"] == 0, "全部文件转存成功")
+check(task.target_vpath.startswith("/盘B"), f"目标盘已切换到盘B: {task.target_vpath}")
+fb = acc_b.client._fake
+names_b = [e["FileName"] for e in fb.entries.values()]
+check("阿凡达.mkv" in names_b and "E01.mkv" in names_b and "字幕.srt" in names_b, "文件实际转存到盘B")
+check(any(e.get("FileName") == "分享" for e in fb.entries.values()), "盘B 已创建「分享」目录")
+st = task.status()
+check("盘B" in st["target_vpath"], f"状态中的目标路径为新盘: {st['target_vpath']}")
+task.close()
+
+# ============ 12. 未启用自动切换 ============
+print("== 12. 未启用自动切换 ==")
+api, acc_a, fake = build_env(a_used=96 * 1024 ** 3, b_total=100 * 1024 ** 3, b_used=10 * 1024 ** 3)
+acc_b = api._accounts[1]
+api._reserve_size = reserve
+api._auto_switch = False
+task = ShareSync(
+    api=api, task_id="t12", name="不切盘",
+    share_key="ShKey-12DEF", share_pwd="",
+    target_vpath="/盘A/分享", db_path=db_file,
+    auto_switch=False, reserve_size=reserve,
+)
+result = task.sync()
+check(result["failed"] == 3 and result["copied"] == 0, "空间不足时全部失败（不切换）")
+check(task.target_vpath.startswith("/盘A"), "目标盘保持不变")
+fb = acc_b.client._fake
+check(not any(e.get("FileName") == "阿凡达.mkv" for e in fb.entries.values()), "盘B 无文件写入")
+task.close()
+
+# ============ 13. 所有盘均空间不足 ============
+print("== 13. 所有盘均空间不足 ==")
+api, acc_a, fake = build_env(a_used=96 * 1024 ** 3, b_total=100 * 1024 ** 3, b_used=99 * 1024 ** 3)
+api._reserve_size = reserve
+api._auto_switch = True
+task = ShareSync(
+    api=api, task_id="t13", name="全满",
+    share_key="ShKey-13DEF", share_pwd="",
+    target_vpath="/盘A/分享", db_path=db_file,
+    auto_switch=True, reserve_size=reserve,
+)
+result = task.sync()
+check(result["failed"] == 3 and result["copied"] == 0, "所有盘不足时全部失败")
+check(any("剩余空间不足" in e for e in result["errors"]), "错误信息含剩余空间不足")
+check(task.target_vpath.startswith("/盘A"), "无可用盘时不切盘")
+task.close()
+
 print(f"\n结果: {passed} 通过, {failed} 失败")
 sys.exit(1 if failed else 0)
