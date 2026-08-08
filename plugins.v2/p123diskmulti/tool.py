@@ -14,6 +14,7 @@
   与 IP/UA/token 类型/文件/节点均无关（已对照实验排除）。
 """
 
+import errno as _errno
 import threading
 import time
 from typing import Callable, Dict, Iterable, List, Optional, Tuple, Union
@@ -22,6 +23,18 @@ import requests
 from p123client import P123Client, check_response
 
 from app.log import logger
+
+# p123client 内部引用了 FreeBSD 专属的 errno.EAUTH（认证错误码，仅 FreeBSD 存在）；
+# 在 Linux/Windows/macOS 上运行时，接口返回 401（登录态失效）时本应抛
+# P123AuthenticationError，却会抛 AttributeError（module 'errno' has no attribute
+# 'EAUTH'），掩盖真实原因。这里补一个可移植等价码（EPERM，语义同为"操作不被允许"），
+# 确保认证失败能被正常识别与日志化（对已修复的 p123client 无影响：FreeBSD 上自带
+# EAUTH 会跳过补丁，其它平台也只是补一个本不存在的常量）。
+if not hasattr(_errno, "EAUTH"):
+    try:
+        _errno.EAUTH = _errno.EPERM
+    except Exception:
+        pass  # 极端环境（如只读 site-packages）下忽略，不影响主流程
 
 # 换链（签票）域名候选，按优先级：
 # - https://api.123278.com/b：123 网页前端实际使用的网关域名（与 123pan.com 同属

@@ -158,6 +158,13 @@ def check_response(resp):
 p123client.check_response = check_response
 # 懒加载客户端，测试中不会真正实例化
 p123client.P123Client = object
+
+
+class P123AuthenticationError(OSError):
+    """模拟 p123client 认证异常（share_ticket 导入用）"""
+
+
+p123client.P123AuthenticationError = P123AuthenticationError
 sys.modules["p123client"] = p123client
 
 # 以包方式导入插件模块（p123_api 内部使用相对导入）

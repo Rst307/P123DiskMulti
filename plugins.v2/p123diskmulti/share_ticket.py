@@ -32,7 +32,7 @@ from urllib.parse import parse_qs, urlsplit
 import requests
 
 from app.log import logger
-from p123client import check_response
+from p123client import P123AuthenticationError, check_response
 
 # 分享票换票网关（与网页前端同域，实测该域签发的票 ur=vpngvaegvngvnp 正常家族）
 SHARE_API_BASE = "https://api.123278.com/b"
@@ -504,6 +504,11 @@ def _search_file(
                 headers=_web_headers(user_agent, token),
             )
             check_response(resp)
+        except P123AuthenticationError as e:
+            logger.warn(
+                f"【123多盘】按需分享搜索定位请求被拒绝（账号登录态失效或接口 401）：{e}"
+            )
+            return None
         except Exception as e:
             logger.warn(f"【123多盘】按需分享搜索定位请求失败: {e}")
             return None
@@ -554,6 +559,11 @@ def _walk_find_file(client, md5: str, size):
                     }
                 )
                 check_response(resp)
+            except P123AuthenticationError as e:
+                logger.warn(
+                    f"【123多盘】按需分享遍历定位请求被拒绝（账号登录态失效或接口 401）：{e}"
+                )
+                return None
             except Exception as e:
                 logger.warn(f"【123多盘】按需分享遍历定位请求失败: {e}")
                 return None
