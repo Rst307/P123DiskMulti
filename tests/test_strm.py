@@ -455,30 +455,56 @@ check(dl is None, "分享失效(code=400)返回 None")
 check(len(tl._share_download_calls) == 1, "code=400 不重试平台模板")
 tl.fake_post._response = None
 
-# 9.6 需登录（code=5112）：依次尝试 web/open_platform/android 三种平台模板均被拒 → None
+# 9.6 需登录（code=5112）：三种平台模板均被拒 → 强制重登一次再试仍被拒 → None
 LOGIN_RESP = {"code": 5112, "message": "您需要注册登录或付费后下载"}
-tl.fake_post._response = [dict(LOGIN_RESP), dict(LOGIN_RESP), dict(LOGIN_RESP)]
+tl.fake_post._response = [dict(LOGIN_RESP)] * 6  # 重登前后各 3 次（三种模板）
 tl._share_download_calls.clear()
+fake_e.relogin_calls = 0
+fake_e.token = "fake-token"
 dl = helper7.resolve_download_url(
     "第二集.mkv", 300, "md5-share2", "", disk_name="盘E"
 )
-check(dl is None, "三种平台模板均需登录返回 None")
+check(dl is None, "重登后仍被要求登录返回 None")
 check(
-    len(tl._share_download_calls) == 3
+    len(tl._share_download_calls) == 6
     and [c["headers"].get("platform") for c in tl._share_download_calls]
-    == ["web", "open_platform", "android"],
-    f"依次尝试三种平台模板: {[c['headers'].get('platform') for c in tl._share_download_calls]}",
+    == ["web", "open_platform", "android", "web", "open_platform", "android"],
+    "重登前后均依次尝试三种平台模板（共 6 次请求）",
 )
+check(fake_e.relogin_calls == 1, "5112 连续被拒时触发一次强制重登")
 tl.fake_post._response = None
 
 # 9.6b 需登录（5112）时后一平台模板换票成功（大文件分享下载场景）
 tl.fake_post._response = [dict(LOGIN_RESP), dict(LOGIN_RESP), None]
 tl._share_download_calls.clear()
+fake_e.relogin_calls = 0
+fake_e.token = "fake-token"
 dl = helper7.resolve_download_url(
     "第二集.mkv", 300, "md5-share2", "", disk_name="盘E"
 )
 check(dl == "http://edge.example/file", "android 模板换票成功")
 check(len(tl._share_download_calls) == 3, "前两次 5112 后成功（共 3 次请求）")
+check(fake_e.relogin_calls == 0, "单模板成功不触发强制重登")
+tl.fake_post._response = None
+
+# 9.6c 需登录（5112）三种模板均被拒 → 强制重登拿新 token 重试成功（自愈）
+helper7._share_ticket_cache.drop(("u9izjv-WeSWv", "40123968", "md5-share2", 300))
+tl.fake_post._response = [dict(LOGIN_RESP)] * 3  # 第一次尝试全被拒，重试走默认成功桩
+tl._share_download_calls.clear()
+fake_e.relogin_calls = 0
+fake_e.token = "fake-token"
+dl = helper7.resolve_download_url(
+    "第二集.mkv", 300, "md5-share2", "", disk_name="盘E"
+)
+check(dl == "http://edge.example/file", "强制重登后重试换票成功（播放自愈）")
+check(fake_e.relogin_calls == 1, "重登一次即恢复")
+auths = [
+    c["headers"].get("Authorization", "") for c in tl._share_download_calls
+]
+check(
+    auths[:3] == ["Bearer fake-token"] * 3 and auths[3:] == ["Bearer fake-token-new1"],
+    f"重试使用重登后的新 token: {auths}",
+)
 tl.fake_post._response = None
 
 # 9.7 老记录无 file_id：按 rel_path 实时定位并回填
@@ -899,6 +925,29 @@ check(
     f"搜索请求头不含插件注入的 Authorization（避免覆盖客户端登录态）: {sorted(search_headers)}",
 )
 check(len(fake_g.upload_request_calls) == 0, "401 被拒兜底同样不调用秒传")
+
+# 11.14 按需分享换票被连续 5112 拒绝（登录态失效）：强制重登后自动重试成功
+# （与 9.6c 同机制，走按需分享懒建链路，对应「您需要注册登录或付费后下载」日志）
+tl.fake_post._response = [dict(LOGIN_RESP)] * 3
+tl._share_download_calls.clear()
+fake_g.relogin_calls = 0
+fake_g.token = "fake-token"
+helper12._on_demand_share_cache.take(("盘G", "md5-ond", 999))
+dl = helper12.resolve_download_url("MOV.A.mkv", 999, "md5-ond", "", disk_name="盘G")
+tl.fake_post._response = None
+check(dl == "http://edge.example/file", "按需分享换票 5112 时强制重登后播放成功")
+check(fake_g.relogin_calls == 1, "换票 5112 触发一次强制重登")
+ond_auths = [
+    c["headers"].get("Authorization", "")
+    for c in tl._share_download_calls
+    if c["url"].endswith("/api/share/download/info")
+]
+check(
+    len(ond_auths) == 4
+    and ond_auths[:3] == ["Bearer fake-token"] * 3
+    and ond_auths[3:] == ["Bearer fake-token-new1"],
+    f"重登前用旧 token、重登后用新 token: {ond_auths}",
+)
 
 print(f"\n结果: {passed} 通过, {failed} 失败")
 sys.exit(1 if failed else 0)

@@ -363,6 +363,15 @@ class P123AutoClient:
 
         return wrapped
 
+    def relogin(self) -> str:
+        """强制重新登录：重建客户端重新 sign_in，返回新 token
+
+        分享票换票被连续 5112 拒绝（token 被服务端作废）时调用；
+        P123Client 构造即登录（passport+password），失败会抛异常由调用方处理。
+        """
+        self._client = P123Client(self._passport, self._password)
+        return getattr(self._client, "token", "") or ""
+
     def set_download_base_urls(self, base_urls: Optional[Iterable[str]] = None):
         """自定义换链域名候选（按优先级排序；空则恢复内置默认）"""
         self._dl_state.base_urls = tuple(

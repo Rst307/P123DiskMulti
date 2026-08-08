@@ -87,11 +87,14 @@ def exchange_share_ticket(
     size,
     user_agent: str = "",
     timeout: float = 8,
+    client=None,
 ) -> Optional[str]:
     """
     换取分享下载票：POST share/download/info → 解码 params 得内嵌 CDN 票 URL
 
     失败返回 None 并输出明确错误日志（400 分享失效 / 5112 需登录 / 风控等）。
+    5112 登录态被拒（三种平台模板均失败）时：若提供 client 则强制重登一次并
+    用新 token 重试换票（123 会作废旧 token，重登自愈），重试仍失败再报错。
     """
     try:
         file_id_int = int(file_id)
@@ -115,62 +118,81 @@ def exchange_share_ticket(
         "etag": str(etag),
         "size": size_int,
     }
-    login_msgs = []
-    for style in _TICKET_HEADER_STYLES:
-        headers = {
-            "User-Agent": user_agent or DEFAULT_UA,
-            "Authorization": f"Bearer {token}" if token else "",
-        }
-        headers.update(style)
-        try:
-            resp = requests.post(
-                f"{SHARE_API_BASE}/api/share/download/info",
-                json=payload,
-                headers=headers,
-                timeout=timeout,
-            )
-        except requests.RequestException as e:
-            logger.warn(f"【123多盘】分享票换票请求异常: {type(e).__name__}: {e}")
+    # 换票：当前 token 被连续 5112 拒绝（登录态失效/作废）时，强制重登一次
+    # 拿新 token 重试（123 会作废旧 token：会话超限/过期/异地登录替换）；
+    # 重试仍失败则输出明确日志并附 token 形态便于诊断。
+    body = None
+    for attempt in (0, 1):
+        login_msgs = []
+        for style in _TICKET_HEADER_STYLES:
+            headers = {
+                "User-Agent": user_agent or DEFAULT_UA,
+                "Authorization": f"Bearer {token}" if token else "",
+            }
+            headers.update(style)
+            try:
+                resp = requests.post(
+                    f"{SHARE_API_BASE}/api/share/download/info",
+                    json=payload,
+                    headers=headers,
+                    timeout=timeout,
+                )
+            except requests.RequestException as e:
+                logger.warn(f"【123多盘】分享票换票请求异常: {type(e).__name__}: {e}")
+                return None
+            try:
+                resp_json = resp.json()
+            except Exception:
+                logger.warn(
+                    f"【123多盘】分享票换票响应异常（HTTP {resp.status_code}）: "
+                    f"{(resp.text or '')[:200]}"
+                )
+                return None
+            code = resp_json.get("code")
+            message = str(resp_json.get("message") or "").strip()
+            if code in (0, None):
+                body = resp_json
+                break  # 换票成功
+            if code == 5112 or "登录" in message:
+                # 登录态校验失败：换下一平台模板重试（token 体系与平台头不匹配）
+                login_msgs.append(f"{style.get('platform')}: {message}")
+                logger.debug(
+                    f"【123多盘】分享票换票需登录（platform={style.get('platform')}），尝试下一模板"
+                )
+                continue
+            # 明确错误码日志（验收标准 3：5112/400/50002 需可辨识）
+            if code == 400 or "源文件不存在" in message:
+                logger.error(
+                    f"【123多盘】分享源文件不存在（code=400 {message}）："
+                    f"分享可能已失效/已重建，请更新分享链接或重新转存"
+                )
+            elif str(code) in ("1010", "50001", "50002") or "download err" in message:
+                logger.error(
+                    f"【123多盘】分享下载通道被风控（code={code} {message}）"
+                )
+            else:
+                logger.error(f"【123多盘】分享票换票失败: code={code} {message}")
             return None
-        try:
-            body = resp.json()
-        except Exception:
-            logger.warn(
-                f"【123多盘】分享票换票响应异常（HTTP {resp.status_code}）: "
-                f"{(resp.text or '')[:200]}"
-            )
-            return None
-        code = body.get("code")
-        message = str(body.get("message") or "").strip()
-        if code in (0, None):
+        if body is not None:
             break  # 换票成功
-        if code == 5112 or "登录" in message:
-            # 登录态校验失败：换下一平台模板重试（token 体系与平台头不匹配）
-            login_msgs.append(f"{style.get('platform')}: {message}")
-            logger.debug(
-                f"【123多盘】分享票换票需登录（platform={style.get('platform')}），尝试下一模板"
-            )
-            continue
-        # 明确错误码日志（验收标准 3：5112/400/50002 需可辨识）
-        if code == 400 or "源文件不存在" in message:
-            logger.error(
-                f"【123多盘】分享源文件不存在（code=400 {message}）："
-                f"分享可能已失效/已重建，请更新分享链接或重新转存"
-            )
-        elif str(code) in ("1010", "50001", "50002") or "download err" in message:
-            logger.error(
-                f"【123多盘】分享下载通道被风控（code={code} {message}）"
-            )
-        else:
-            logger.error(f"【123多盘】分享票换票失败: code={code} {message}")
-        return None
-    else:
-        # 所有平台模板均被要求登录
+        # 三种平台模板均被要求登录：强制重登账号后重试一次（新 token 换票）
+        if attempt == 0 and client is not None and _force_relogin(client):
+            token = getattr(client, "token", "") or ""
+            if token:
+                logger.warn(
+                    "【123多盘】分享票换票被要求登录态（5112），已强制重登账号并重试换票"
+                )
+                continue
+        break
+    if body is None:
+        live = getattr(client, "token", "") if client is not None else token
+        live = live or ""
         logger.error(
             "【123多盘】分享下载要求登录态（code=5112 "
             f"{'；'.join(login_msgs)}"
             "），已尝试 web/open_platform/android 三种平台模板均被拒绝，"
-            "请检查插件账号登录状态（123 大文件分享下载必须携带有效登录态）"
+            "请检查插件账号登录状态（123 大文件分享下载必须携带有效登录态；"
+            f"当前 token 长度 {len(live)}，段数 {live.count('.')}）"
         )
         return None
     data = body.get("data") or {}
@@ -195,6 +217,29 @@ def exchange_share_ticket(
         return None
     logger.debug(f"【123多盘】分享票换票成功: {inner[:200]}")
     return inner
+
+
+def _force_relogin(client) -> bool:
+    """强制账号重新登录：换票被连续 5112 拒绝时 token 可能已被服务端作废
+
+    优先调用客户端 relogin()（P123AutoClient 重建客户端重新 sign_in）；
+    兜底调用 login()（p123client 会用已存的账号密码重新登录覆盖 token）。
+    :return: 是否已取得新 token（与旧 token 不同且非空）
+    """
+    old_token = getattr(client, "token", "") or ""
+    try:
+        relogin = getattr(client, "relogin", None)
+        if callable(relogin):
+            relogin()
+        else:
+            login = getattr(client, "login", None)
+            if callable(login):
+                login()
+    except Exception as e:
+        logger.warn(f"【123多盘】分享票换票前强制重登失败: {e}")
+        return False
+    new_token = getattr(client, "token", "") or ""
+    return bool(new_token) and new_token != old_token
 
 
 def ticket_ttl(
@@ -341,20 +386,28 @@ def get_share_download_url(
     user_agent: str = "",
     cache: Optional[ShareTicketCache] = None,
     timeout: float = 8,
+    client=None,
 ) -> Optional[str]:
     """
     分享票完整链路：缓存命中 → 210 解析；未命中 → 换票 → 缓存 → 210 解析
 
     210 解析遇 403（风控）时丢弃缓存、重新换票重试一次（票轮换策略，
     应对单票被标记）；整通道风控时输出明确日志后返回 None。
+    提供 client 时：以客户端当前登录态为准（前面的定位/兜底操作可能已触发
+    自动重登，token 已变新）；换票遇 5112 登录态被拒会自动强制重登重试。
     :return: 可直接 302 给 Emby 的最终边缘 URL；失败 None
     """
+    if client is not None:
+        # 以客户端当前登录态为准（定位/兜底等操作可能已触发自动重登）
+        live = getattr(client, "token", "") or ""
+        if live:
+            token = live
     key = (str(share_key), str(file_id), str(etag), int(size or 0))
     inner = cache.get(key) if cache else None
     if inner is None:
         inner = exchange_share_ticket(
             token, share_key, share_pwd, file_id, s3_key_flag,
-            etag, size, user_agent=user_agent, timeout=timeout,
+            etag, size, user_agent=user_agent, timeout=timeout, client=client,
         )
         if not inner:
             return None
@@ -380,7 +433,7 @@ def get_share_download_url(
             cache.drop(key)
         inner2 = exchange_share_ticket(
             token, share_key, share_pwd, file_id, s3_key_flag,
-            etag, size, user_agent=user_agent, timeout=timeout,
+            etag, size, user_agent=user_agent, timeout=timeout, client=client,
         )
         if not inner2:
             return None
@@ -737,6 +790,10 @@ def get_on_demand_share_url(
             _cancel_share(account.client, rec.get("share_id"))  # 到期自动清理
             rec = None
         else:
+            token = getattr(account.client, "token", "") or ""
+            if not token:
+                logger.error("【123多盘】按需分享换票缺少登录态（账号未登录）")
+                return None
             url = get_share_download_url(
                 token,
                 rec["share_key"],
@@ -748,6 +805,7 @@ def get_on_demand_share_url(
                 user_agent=user_agent,
                 cache=ticket_cache,
                 timeout=timeout,
+                client=account.client,
             )
             if url:
                 if share_cache:
@@ -805,6 +863,7 @@ def get_on_demand_share_url(
         user_agent=user_agent,
         cache=ticket_cache,
         timeout=timeout,
+        client=account.client,
     )
     if url and share_cache:
         share_cache.set(key, rec)

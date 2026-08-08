@@ -205,6 +205,12 @@ class FakeP123Client:
         self.fs_list_new_calls = []
         self.search_off = False  # True 时全局搜索返回空（模拟搜索未命中）
         self.fail_search_401 = False  # True 时全局搜索抛 401 认证异常（模拟登录态失效）
+        self.relogin_calls = 0  # 强制重登次数（换票 5112 自愈用）
+
+    def relogin(self):
+        """模拟强制重登：换发新 token"""
+        self.relogin_calls += 1
+        self.token = f"fake-token-new{self.relogin_calls}"
 
     def _new_id(self):
         self.next_id += 1

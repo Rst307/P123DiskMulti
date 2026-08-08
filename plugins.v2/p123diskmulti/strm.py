@@ -382,6 +382,7 @@ class StrmHelper:
                     size=size,
                     user_agent=user_agent,
                     cache=self._share_ticket_cache,
+                    client=account.client,
                 )
                 if url:
                     logger.debug(
