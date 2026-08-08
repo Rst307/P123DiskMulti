@@ -44,7 +44,7 @@ class P123DiskMulti(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/DDSRem-Dev/MoviePilot-Plugins/main/icons/P123Disk.png"
     # 插件版本
-    plugin_version = "1.4.1"
+    plugin_version = "1.4.2"
     # 插件作者
     plugin_author = "Rst307"
     # 作者主页
@@ -69,6 +69,10 @@ class P123DiskMulti(_PluginBase):
         # STRM 助手与定时任务
         self._strm: Optional[StrmHelper] = None
         self._scheduler: Optional[BackgroundScheduler] = None
+        # 下载换链域名（高级）：每行一个，留空用内置默认
+        self._download_base_urls: Optional[List[str]] = None
+        # 下载票探测 + 通道风控自动切换域名
+        self._download_probe = True
         # 分享增量同步任务
         self._shares: List[ShareSync] = []
         # 定期目录整理（调用 MoviePilot 整理链）
@@ -103,6 +107,14 @@ class P123DiskMulti(_PluginBase):
             self._full_sync_overwrite = config.get("full_sync_overwrite", False)
             self._refresh_mediaserver = config.get("refresh_mediaserver", False)
             self._mediaserver_names = config.get("mediaserver_names") or ""
+
+            # 下载换链域名（高级）：每行一个，留空用内置默认
+            self._download_base_urls = [
+                l.strip()
+                for l in str(config.get("download_base_urls") or "").splitlines()
+                if l.strip()
+            ] or None
+            self._download_probe = config.get("download_probe", True)
 
             # 分享增量同步配置
             self._share_enabled = config.get("share_enabled", False)
@@ -164,6 +176,8 @@ class P123DiskMulti(_PluginBase):
             api=self._api,
             moviepilot_address=self._moviepilot_address,
             media_exts=DEFAULT_MEDIA_EXTS,
+            download_base_urls=self._download_base_urls,
+            download_probe=self._download_probe,
         )
         if self._full_sync_paths and self._full_sync_cron:
             try:
@@ -900,6 +914,39 @@ class P123DiskMulti(_PluginBase):
                             },
                             {
                                 "component": "VCol",
+                                "props": {"cols": 12, "md": 4},
+                                "content": [
+                                    {
+                                        "component": "VSwitch",
+                                        "props": {
+                                            "model": "download_probe",
+                                            "label": "风控自动切换换链域名",
+                                            "color": "primary",
+                                            "hint": "换链后探测下载票有效性，被风控（403 50002/1010）时自动切换到另一换链通道，避免全库无法播放",
+                                            "persistent-hint": True,
+                                        },
+                                    }
+                                ],
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 8},
+                                "content": [
+                                    {
+                                        "component": "VTextarea",
+                                        "props": {
+                                            "model": "download_base_urls",
+                                            "rows": 2,
+                                            "label": "下载换链域名（高级）",
+                                            "placeholder": "https://api.123278.com/b",
+                                            "hint": "每行一个，按优先级尝试；留空用内置默认（api.123278.com/b 优先，p123client 默认域名兜底）。仅当 123 更换域名或默认通道失效时需调整",
+                                            "persistent-hint": True,
+                                        },
+                                    }
+                                ],
+                            },
+                            {
+                                "component": "VCol",
                                 "props": {"cols": 12},
                                 "content": [
                                     {
@@ -1258,6 +1305,9 @@ class P123DiskMulti(_PluginBase):
             "full_sync_overwrite": False,
             "refresh_mediaserver": False,
             "mediaserver_names": "",
+            # 下载换链域名（高级）：留空用内置默认
+            "download_base_urls": "",
+            "download_probe": True,
             # 分享增量同步默认配置
             "share_enabled": False,
             "shares_text": "",
@@ -1500,6 +1550,21 @@ class P123DiskMulti(_PluginBase):
                     "component": "div",
                     "props": {"class": "text-caption"},
                     "text": f"• MoviePilot 地址：{self._moviepilot_address or '未配置（无法生成 STRM URL）'}",
+                }
+            )
+            strm_status_lines.append(
+                {
+                    "component": "div",
+                    "props": {"class": "text-caption"},
+                    "text": (
+                        "• 下载换链："
+                        + (
+                            f"自定义 {len(self._download_base_urls)} 个域名"
+                            if self._download_base_urls
+                            else "默认双通道（api.123278.com/b + yun 通道）"
+                        )
+                        + f"，风控自动切换{'开启' if self._download_probe else '关闭'}"
+                    ),
                 }
             )
             # 后台同步状态

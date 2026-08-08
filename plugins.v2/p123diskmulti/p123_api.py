@@ -691,9 +691,13 @@ class P123MultiApi:
                 "S3KeyFlag": s3keyflag,
                 "Size": int(size),
             }
-            resp = account.client.download_info(payload)
-            check_response(resp)
-            download_url = resp["data"]["DownloadUrl"]
+            # 换取并验证下载直链（通道被风控时自动切换换链域名）
+            download_url = account.client.get_download_url(payload)
+            if not download_url:
+                logger.error(
+                    f"【123多盘】获取下载链接失败（所有换链通道被风控或不可用）: {fileitem.name}"
+                )
+                return None
             local_path = (path or settings.TEMP_PATH) / fileitem.name
         except Exception as e:
             logger.error(f"【123多盘】获取下载链接失败: {fileitem.name} - {str(e)}")

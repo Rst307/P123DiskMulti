@@ -204,5 +204,101 @@ check(st.get("last_time"), "状态含上次时间")
 check(st["last_result"]["ok"] == 0 and st["last_result"]["skip"] == 3, "后台结果正确（默认模式跳过已存在）")
 check("result" in done_flag and done_flag["result"]["skip"] == 3, "完成回调被调用")
 
+# ============ 7. 换链域名风控自动切换 ============
+print("== 7. 换链域名风控自动切换 ==")
+import P123DiskMulti.tool as tool_mod  # noqa: E402
+
+# 新建独立账号环境（避免污染前序测试的域名状态）
+api2 = P123MultiApi(disks=[], disk_name="123云盘")
+acc_c = tl.make_account("盘C", 10 * 1024 ** 3, 1 * 1024 ** 3)
+api2._accounts = [acc_c]
+fake_c = acc_c.client._fake
+helper2 = StrmHelper(api=api2, moviepilot_address="http://127.0.0.1:3000")
+
+_orig_probe = tool_mod.probe_download_url
+probe_queue: list = []
+
+
+def _fake_probe(url, headers=None, timeout=8):
+    return probe_queue.pop(0)
+
+
+tool_mod.probe_download_url = _fake_probe
+
+# 7.1 第一候选域名正常：直接返回
+fake_c.last_download_bases = []
+probe_queue = [(True, 206, "")]
+dl = helper2.resolve_download_url("a.mkv", 100, "m1", "s1", disk_name="盘C")
+check(dl == "http://download/1", "票有效时直接返回")
+check(fake_c.last_download_bases == ["https://api.123278.com/b"],
+      f"默认优先使用 api.123278.com/b: {fake_c.last_download_bases}")
+
+# 7.2 第一候选被风控（403 50002/1010）→ 自动切换第二域名
+fake_c.last_download_bases = []
+probe_queue = [
+    (False, 403, "message=download err: 50002 code=1010"),
+    (True, 206, ""),
+]
+dl = helper2.resolve_download_url("b.mkv", 100, "m2", "s2", disk_name="盘C")
+check(dl == "http://download/1", "被风控后切换域名换链成功")
+check(fake_c.last_download_bases == ["https://api.123278.com/b", ""],
+      f"先默认域名后自动切换: {fake_c.last_download_bases}")
+
+# 7.3 工作域名记忆：第二次起直接走验证通过的域名
+fake_c.last_download_bases = []
+probe_queue = [(True, 206, "")]
+dl = helper2.resolve_download_url("c.mkv", 100, "m3", "s3", disk_name="盘C")
+check(dl == "http://download/1", "再次换链成功")
+check(fake_c.last_download_bases == [""],
+      f"优先使用已验证域名(默认域): {fake_c.last_download_bases}")
+
+# 7.4 全部通道被风控 → 返回 None
+probe_queue = [
+    (False, 403, "message=download err: 50002 code=1010"),
+    (False, 403, "message=download err: 50002 code=1010"),
+]
+dl = helper2.resolve_download_url("d.mkv", 100, "m4", "s4", disk_name="盘C")
+check(dl is None, "全部通道被风控时返回 None")
+
+# 7.5 探测网络异常（无法判定）→ 按原链接返回，不做切换
+probe_queue = [(False, 0, "ConnectionError: x")]
+dl = helper2.resolve_download_url("e.mkv", 100, "m5", "s5", disk_name="盘C")
+check(dl == "http://download/1", "探测网络异常时按原链接返回")
+
+# 7.6 地域绑定 403（realc/city）→ 记日志并继续尝试其他通道
+probe_queue = [
+    (False, 403, "message=forbidden realc:chongqing city arg_c:shanghai code=1010"),
+    (True, 206, ""),
+]
+dl = helper2.resolve_download_url("f.mkv", 100, "m6", "s6", disk_name="盘C")
+check(dl == "http://download/1", "地域绑定错误也尝试切换通道")
+
+# 7.7 关闭探测：不验证直接返回换链结果
+helper3 = StrmHelper(
+    api=api2, moviepilot_address="http://127.0.0.1:3000", download_probe=False
+)
+fake_c.last_download_bases = []
+probe_queue = [(False, 403, "message=download err: 50002 code=1010")]  # 不应被消费
+fake_c.last_download_bases = []
+dl = helper3.resolve_download_url("g.mkv", 100, "m7", "s7", disk_name="盘C")
+check(dl == "http://download/1", "关闭探测时直接返回换链结果")
+check(len(probe_queue) == 1 and fake_c.last_download_bases == [""],
+      "关闭探测时未调用探测、且沿用已验证域名")
+
+# 7.8 自定义换链域名候选
+helper4 = StrmHelper(
+    api=api2,
+    moviepilot_address="http://127.0.0.1:3000",
+    download_base_urls=["https://custom.example.com/b"],
+)
+fake_c.last_download_bases = []
+probe_queue = [(True, 206, "")]
+dl = helper4.resolve_download_url("h.mkv", 100, "m8", "s8", disk_name="盘C")
+check(dl == "http://download/1", "自定义域名换链成功")
+check(fake_c.last_download_bases == ["https://custom.example.com/b"],
+      f"使用自定义域名: {fake_c.last_download_bases}")
+
+tool_mod.probe_download_url = _orig_probe
+
 print(f"\n结果: {passed} 通过, {failed} 失败")
 sys.exit(1 if failed else 0)

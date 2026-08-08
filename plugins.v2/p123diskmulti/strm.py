@@ -58,6 +58,8 @@ class StrmHelper:
         api,
         moviepilot_address: str = "",
         media_exts: Optional[List[str]] = None,
+        download_base_urls: Optional[List[str]] = None,
+        download_probe: bool = True,
     ):
         self._api = api
         self._moviepilot_address = str(moviepilot_address or "").rstrip("/")
@@ -66,6 +68,13 @@ class StrmHelper:
             for ext in (media_exts or DEFAULT_MEDIA_EXTS)
             if ext.strip()
         )
+        # 下载换链域名候选（None 用内置默认：api.123278.com/b 优先，yun 通道兜底）
+        self._download_base_urls = (
+            [u.strip() for u in (download_base_urls or []) if u and u.strip()]
+            or None
+        )
+        # 是否探测下载票有效性并在通道被风控时自动切换域名
+        self._download_probe = bool(download_probe)
         # 全量同步防重入锁
         self._sync_lock = threading.Lock()
         # 后台同步状态（start_full_sync 更新，sync_status 读取）
@@ -154,22 +163,23 @@ class StrmHelper:
                 logger.debug(
                     f"【123多盘STRM】秒传转存成功，获取 S3KeyFlag: {s3_key_flag}"
                 )
-            # 换取下载地址
-            resp = client.download_info(
+            # 换取下载地址：自动验证票有效性，通道被风控（403 50002/1010）时自动切换换链域名
+            url = client.get_download_url(
                 {
                     "S3KeyFlag": s3_key_flag,
                     "FileName": name,
                     "Etag": md5,
                     "Size": int(size or 0),
                 },
-                base_url="",
-                async_=False,
                 headers={"User-Agent": user_agent or DEFAULT_UA},
+                base_urls=self._download_base_urls,
+                probe=self._download_probe,
             )
-            check_response(resp)
-            url = resp.get("data", {}).get("DownloadUrl")
             if not url:
-                logger.error("【123多盘STRM】换取下载地址失败，返回数据缺少 DownloadUrl")
+                logger.error(
+                    "【123多盘STRM】换取下载地址失败（所有换链通道被风控或不可用），"
+                    "请查看插件日志确认 123 账号状态"
+                )
                 return None
             logger.debug(f"【123多盘STRM】获取下载地址成功: {url}")
             return url

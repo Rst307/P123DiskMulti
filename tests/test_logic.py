@@ -337,13 +337,17 @@ class FakeP123Client:
 
     def download_info(self, payload, base_url="", async_=False, **kwargs):
         self.pending_download_file_id = int(payload.get("FileID", 0) or 0)
+        self.last_download_bases = getattr(self, "last_download_bases", [])
+        self.last_download_bases.append(base_url)
         return {"code": 0, "data": {"DownloadUrl": "http://download/1"}}
 
 
 # 模拟 requests.get（下载）
 class FakeResp:
-    def __init__(self, data):
+    def __init__(self, data, status_code=206):
         self._data = data
+        self.status_code = status_code
+        self.text = str(data)[:200]
 
     def __enter__(self):
         return self
@@ -352,6 +356,12 @@ class FakeResp:
         return False
 
     def raise_for_status(self):
+        pass
+
+    def json(self):
+        raise ValueError("not json")
+
+    def close(self):
         pass
 
     def iter_content(self, chunk_size):
@@ -366,6 +376,10 @@ _fake_clients = []
 
 
 def fake_get(url, stream=True, **kwargs):
+    headers = kwargs.get("headers") or {}
+    if headers.get("Range"):
+        # 下载票探测请求（Range 首字节）：不消费下载内容状态，直接返回 206
+        return FakeResp(b"", status_code=206)
     for fake in _fake_clients:
         if fake.pending_download_file_id is not None:
             data = fake.file_contents.get(fake.pending_download_file_id, b"")
@@ -375,12 +389,32 @@ def fake_get(url, stream=True, **kwargs):
 
 
 # 让 DiskAccount 使用我们的假客户端
+# 下载换链域名逻辑与生产一致：复用 tool.py 的 exchange_and_validate
+import P123DiskMulti.tool as _tool  # noqa: E402
+
+
 class FakeAutoClient:
     def __init__(self, fake):
         self._fake = fake
+        self._dl_state = _tool.DownloadTicketState(None)
 
     def __getattr__(self, name):
         return getattr(self._fake, name)
+
+    def set_download_base_urls(self, base_urls=None):
+        self._dl_state.base_urls = tuple(
+            base_urls or _tool.DEFAULT_DOWNLOAD_BASE_URLS
+        )
+
+    def get_download_url(self, payload, headers=None, base_urls=None,
+                         probe=True, timeout=8):
+        if base_urls is not None:
+            self.set_download_base_urls(base_urls)
+        return _tool.exchange_and_validate(
+            self._fake, payload, headers=headers, state=self._dl_state,
+            probe=_tool.probe_download_url if probe else False,
+            timeout=timeout,
+        )
 
 
 def make_account(name, total, used, client=None):
