@@ -445,20 +445,40 @@ tool_mod.probe_download_url = _orig_probe2
 dl = helper8.resolve_download_url("别的.mkv", 100, "md5-none", "s3x", disk_name="盘E")
 check(dl == "http://download/1", "auto 模式无分享记录回退 VIP 直链")
 
-# 9.5 分享失效（code=400）→ None，日志可辨识
+# 9.5 分享失效（code=400）→ None，日志可辨识（非登录态错误，不重试平台模板）
 tl.fake_post._response = {"code": 400, "message": "非法请求，源文件不存在"}
+tl._share_download_calls.clear()
 dl = helper7.resolve_download_url(
     "第二集.mkv", 300, "md5-share2", "", disk_name="盘E"
 )
 check(dl is None, "分享失效(code=400)返回 None")
+check(len(tl._share_download_calls) == 1, "code=400 不重试平台模板")
 tl.fake_post._response = None
 
-# 9.6 需登录（code=5112）→ None
-tl.fake_post._response = {"code": 5112, "message": "您需要注册登录或付费后下载"}
+# 9.6 需登录（code=5112）：依次尝试 web/open_platform/android 三种平台模板均被拒 → None
+LOGIN_RESP = {"code": 5112, "message": "您需要注册登录或付费后下载"}
+tl.fake_post._response = [dict(LOGIN_RESP), dict(LOGIN_RESP), dict(LOGIN_RESP)]
+tl._share_download_calls.clear()
 dl = helper7.resolve_download_url(
     "第二集.mkv", 300, "md5-share2", "", disk_name="盘E"
 )
-check(dl is None, "需登录(code=5112)返回 None")
+check(dl is None, "三种平台模板均需登录返回 None")
+check(
+    len(tl._share_download_calls) == 3
+    and [c["headers"].get("platform") for c in tl._share_download_calls]
+    == ["web", "open_platform", "android"],
+    f"依次尝试三种平台模板: {[c['headers'].get('platform') for c in tl._share_download_calls]}",
+)
+tl.fake_post._response = None
+
+# 9.6b 需登录（5112）时后一平台模板换票成功（大文件分享下载场景）
+tl.fake_post._response = [dict(LOGIN_RESP), dict(LOGIN_RESP), None]
+tl._share_download_calls.clear()
+dl = helper7.resolve_download_url(
+    "第二集.mkv", 300, "md5-share2", "", disk_name="盘E"
+)
+check(dl == "http://edge.example/file", "android 模板换票成功")
+check(len(tl._share_download_calls) == 3, "前两次 5112 后成功（共 3 次请求）")
 tl.fake_post._response = None
 
 # 9.7 老记录无 file_id：按 rel_path 实时定位并回填

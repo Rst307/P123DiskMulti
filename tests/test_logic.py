@@ -499,13 +499,21 @@ def fake_get(url, stream=True, **kwargs):
     return FakeResp(b"")
 
 
-# 分享票换票（share/download/info）桩：记录调用，可配置响应
+# 分享票换票（share/download/info）桩：记录调用，可配置响应（dict=固定，list=按次弹出）
 _share_download_calls = []
 
 
 def fake_post(url, **kwargs):
-    _share_download_calls.append({"url": url, "json": kwargs.get("json") or {}})
+    _share_download_calls.append(
+        {
+            "url": url,
+            "json": kwargs.get("json") or {},
+            "headers": kwargs.get("headers") or {},
+        }
+    )
     response = getattr(fake_post, "_response", None)
+    if isinstance(response, list):
+        response = response.pop(0) if response else None
     if response is None:
         import base64 as _b64
         inner = (

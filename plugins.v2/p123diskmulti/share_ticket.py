@@ -6,7 +6,8 @@
 异常特征；最坏情况是单条分享链接被风控（重建分享即可），账号不受影响。
 
 链路（2026-08-08 实测验证）：
-1. POST {SHARE_API_BASE}/api/share/download/info（需 Authorization: Bearer 任意已登录账号 token）
+1. POST {SHARE_API_BASE}/api/share/download/info（需 Authorization: Bearer 任意已登录账号 token；
+   登录态校验失败（5112）时依次尝试 open_platform/android 平台模板，与本插件 token 体系匹配）
    → data.DownloadURL = https://web-pro2.123952.com/download-v2/?params=<base64>
    params 直接 base64 解码即得真实 CDN 票 URL（无需请求中转页）
 2. GET 内嵌 CDN 票（带 Range，auto_redirect=0）→ 网关返回 HTTP 210
@@ -38,6 +39,15 @@ SHARE_API_BASE = "https://api.123278.com/b"
 # 网页前端请求头模板（实测必需：platform: web + App-Version）
 WEB_PLATFORM = "web"
 WEB_APP_VERSION = "132"
+# 分享票换票请求头模板（按序尝试，仅登录态校验失败时切换下一档）：
+# - web：网页前端模板（v1.4.5 实测：小文件/免登录流量未告罄时可用）
+# - open_platform：与 VIP 换链同款（api.123278.com/b 实测可用；大文件需登录时仍可换票）
+# - android：社区 p123client 同款（open 平台 token + android 头，社区下载器日常验证）
+_TICKET_HEADER_STYLES = (
+    {"platform": WEB_PLATFORM, "App-Version": WEB_APP_VERSION},
+    {"platform": "open_platform", "app-version": "3"},
+    {"platform": "android", "app-version": "3"},
+)
 # 默认 User-Agent（未传入时使用）
 DEFAULT_UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -99,34 +109,44 @@ def exchange_share_ticket(
         "etag": str(etag),
         "size": size_int,
     }
-    try:
-        resp = requests.post(
-            f"{SHARE_API_BASE}/api/share/download/info",
-            json=payload,
-            headers=_web_headers(user_agent, token),
-            timeout=timeout,
-        )
-    except requests.RequestException as e:
-        logger.warn(f"【123多盘】分享票换票请求异常: {type(e).__name__}: {e}")
-        return None
-    try:
-        body = resp.json()
-    except Exception:
-        logger.warn(
-            f"【123多盘】分享票换票响应异常（HTTP {resp.status_code}）: "
-            f"{(resp.text or '')[:200]}"
-        )
-        return None
-    code = body.get("code")
-    message = str(body.get("message") or "").strip()
-    if code not in (0, None):
-        # 明确错误码日志（验收标准 3：5112/400/50002 需可辨识）
-        if code == 5112 or "登录" in message:
-            logger.error(
-                f"【123多盘】分享下载要求登录态（code=5112 {message}），"
-                f"请检查插件账号登录状态"
+    login_msgs = []
+    for style in _TICKET_HEADER_STYLES:
+        headers = {
+            "User-Agent": user_agent or DEFAULT_UA,
+            "Authorization": f"Bearer {token}" if token else "",
+        }
+        headers.update(style)
+        try:
+            resp = requests.post(
+                f"{SHARE_API_BASE}/api/share/download/info",
+                json=payload,
+                headers=headers,
+                timeout=timeout,
             )
-        elif code == 400 or "源文件不存在" in message:
+        except requests.RequestException as e:
+            logger.warn(f"【123多盘】分享票换票请求异常: {type(e).__name__}: {e}")
+            return None
+        try:
+            body = resp.json()
+        except Exception:
+            logger.warn(
+                f"【123多盘】分享票换票响应异常（HTTP {resp.status_code}）: "
+                f"{(resp.text or '')[:200]}"
+            )
+            return None
+        code = body.get("code")
+        message = str(body.get("message") or "").strip()
+        if code in (0, None):
+            break  # 换票成功
+        if code == 5112 or "登录" in message:
+            # 登录态校验失败：换下一平台模板重试（token 体系与平台头不匹配）
+            login_msgs.append(f"{style.get('platform')}: {message}")
+            logger.debug(
+                f"【123多盘】分享票换票需登录（platform={style.get('platform')}），尝试下一模板"
+            )
+            continue
+        # 明确错误码日志（验收标准 3：5112/400/50002 需可辨识）
+        if code == 400 or "源文件不存在" in message:
             logger.error(
                 f"【123多盘】分享源文件不存在（code=400 {message}）："
                 f"分享可能已失效/已重建，请更新分享链接或重新转存"
@@ -137,6 +157,15 @@ def exchange_share_ticket(
             )
         else:
             logger.error(f"【123多盘】分享票换票失败: code={code} {message}")
+        return None
+    else:
+        # 所有平台模板均被要求登录
+        logger.error(
+            "【123多盘】分享下载要求登录态（code=5112 "
+            f"{'；'.join(login_msgs)}"
+            "），已尝试 web/open_platform/android 三种平台模板均被拒绝，"
+            "请检查插件账号登录状态（123 大文件分享下载必须携带有效登录态）"
+        )
         return None
     data = body.get("data") or {}
     dl_url = data.get("DownloadURL") or data.get("downloadURL") or ""
