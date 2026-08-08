@@ -44,7 +44,7 @@ class P123DiskMulti(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/DDSRem-Dev/MoviePilot-Plugins/main/icons/P123Disk.png"
     # 插件版本
-    plugin_version = "1.4.4"
+    plugin_version = "1.4.5"
     # 插件作者
     plugin_author = "Rst307"
     # 作者主页
@@ -75,6 +75,8 @@ class P123DiskMulti(_PluginBase):
         self._download_probe = True
         # 已验证下载直链缓存秒数（降低签票频率，防止风控触发）
         self._download_cache_ttl = 600
+        # 播放票模式：vip | share | auto
+        self._ticket_mode = "vip"
         # 分享增量同步任务
         self._shares: List[ShareSync] = []
         # 定期目录整理（调用 MoviePilot 整理链）
@@ -122,6 +124,11 @@ class P123DiskMulti(_PluginBase):
             except (TypeError, ValueError):
                 self._download_cache_ttl = 600
 
+            # 播放票模式（vip=VIP直链 | share=分享票 | auto=分享票优先+VIP兜底）
+            self._ticket_mode = str(config.get("ticket_mode") or "vip").strip().lower()
+            if self._ticket_mode not in ("vip", "share", "auto"):
+                self._ticket_mode = "vip"
+
             # 分享增量同步配置
             self._share_enabled = config.get("share_enabled", False)
             self._shares_text = config.get("shares_text") or ""
@@ -160,10 +167,10 @@ class P123DiskMulti(_PluginBase):
                     logger.info(
                         f"【123多盘】插件已启用，共 {len(accounts)} 个网盘：{', '.join(a.name for a in accounts)}"
                     )
+                    # 初始化分享增量同步（分享票模式依赖分享任务，必须先于 STRM 初始化）
+                    self._init_shares()
                     # 初始化 STRM 助手（多盘）
                     self._init_strm()
-                    # 初始化分享增量同步
-                    self._init_shares()
                     # 初始化定期目录整理
                     self._init_organize()
                 else:
@@ -185,6 +192,8 @@ class P123DiskMulti(_PluginBase):
             download_base_urls=self._download_base_urls,
             download_probe=self._download_probe,
             download_cache_ttl=self._download_cache_ttl,
+            ticket_mode=self._ticket_mode,
+            shares=self._shares,
         )
         if self._full_sync_paths and self._full_sync_cron:
             try:
@@ -970,6 +979,35 @@ class P123DiskMulti(_PluginBase):
                             },
                             {
                                 "component": "VCol",
+                                "props": {"cols": 12, "md": 4},
+                                "content": [
+                                    {
+                                        "component": "VSelect",
+                                        "props": {
+                                            "model": "ticket_mode",
+                                            "label": "播放票类型",
+                                            "items": [
+                                                {
+                                                    "title": "VIP 直链（默认）",
+                                                    "value": "vip",
+                                                },
+                                                {
+                                                    "title": "分享票",
+                                                    "value": "share",
+                                                },
+                                                {
+                                                    "title": "自动（分享票优先，失败回退 VIP）",
+                                                    "value": "auto",
+                                                },
+                                            ],
+                                            "hint": "VIP 直链：账号直链换链，带域名风控自动切换；分享票：通过分享下载票播放（多 IP 播放为分享设计内行为，不受账号 VIP 通道风控影响，仅分享转存入库的文件可用，需启用分享增量同步）；自动：分享票优先、失败自动回退 VIP",
+                                            "persistent-hint": True,
+                                        },
+                                    }
+                                ],
+                            },
+                            {
+                                "component": "VCol",
                                 "props": {"cols": 12},
                                 "content": [
                                     {
@@ -1332,6 +1370,7 @@ class P123DiskMulti(_PluginBase):
             "download_base_urls": "",
             "download_probe": True,
             "download_cache_ttl": 600,
+            "ticket_mode": "vip",
             # 分享增量同步默认配置
             "share_enabled": False,
             "shares_text": "",
@@ -1593,6 +1632,7 @@ class P123DiskMulti(_PluginBase):
                             if self._download_cache_ttl > 0
                             else "，直链缓存关闭"
                         )
+                        + f"，播放票: {'VIP直链' if self._ticket_mode == 'vip' else '分享票' if self._ticket_mode == 'share' else '自动(分享票优先)'}"
                     ),
                 }
             )

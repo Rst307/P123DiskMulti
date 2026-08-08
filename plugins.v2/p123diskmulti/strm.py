@@ -19,13 +19,15 @@ import threading
 import weakref
 from datetime import datetime
 from pathlib import Path, PurePosixPath
-from typing import Callable, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 from urllib.parse import quote
 
 from p123client import check_response
 
 from app.log import logger
 from app.schemas import FileItem
+
+from .share_ticket import ShareTicketCache, get_share_download_url
 
 # 默认媒体扩展名（与 p123strmhelper 保持一致）
 DEFAULT_MEDIA_EXTS = [
@@ -61,6 +63,8 @@ class StrmHelper:
         download_base_urls: Optional[List[str]] = None,
         download_probe: bool = True,
         download_cache_ttl: int = 600,
+        ticket_mode: str = "vip",
+        shares: Optional[list] = None,
     ):
         self._api = api
         self._moviepilot_address = str(moviepilot_address or "").rstrip("/")
@@ -81,6 +85,14 @@ class StrmHelper:
             self._download_cache_ttl = int(download_cache_ttl or 0)
         except (TypeError, ValueError):
             self._download_cache_ttl = 600
+        # 播放票模式：vip=VIP直链（默认，兼容旧行为）| share=分享票 | auto=分享票优先+VIP兜底
+        self._ticket_mode = str(ticket_mode or "vip").strip().lower()
+        if self._ticket_mode not in ("vip", "share", "auto"):
+            self._ticket_mode = "vip"
+        # 分享任务列表（分享票模式：md5 -> 分享记录 -> shareKey/FileId 反查用）
+        self._shares = list(shares or [])
+        # 分享票缓存（只缓存换票结果，每次播放仍做一次 210 解析）
+        self._share_ticket_cache = ShareTicketCache()
         # 全量同步防重入锁
         self._sync_lock = threading.Lock()
         # 后台同步状态（start_full_sync 更新，sync_status 读取）
@@ -142,6 +154,12 @@ class StrmHelper:
         优先使用文件所在网盘的账号换取；带 S3KeyFlag 时直接换取，
         无 S3KeyFlag（兼容旧版 STRM URL）时先秒传转存获取标识再换取。
 
+        播放通道按 ticket_mode 选择：
+        - vip：VIP 直链换链（默认，支持域名风控自动切换）
+        - share：分享票（share/download/info），多 IP 播放为分享设计内行为，
+          不受 VIP 通道风控影响；仅分享转存入库的文件可用
+        - auto：分享票优先，失败自动回退 VIP 直链
+
         :return: 下载地址，失败返回 None
         """
         account = self._pick_account(disk_name)
@@ -150,6 +168,27 @@ class StrmHelper:
             return None
         client = account.client
         try:
+            # 分享票模式：先走分享通道（多 IP 下载是分享设计内行为，无账号级风控）
+            if self._ticket_mode in ("share", "auto"):
+                share_url = self._resolve_share_ticket_url(
+                    name=name,
+                    size=int(size or 0),
+                    md5=md5,
+                    user_agent=user_agent or DEFAULT_UA,
+                    disk_name=disk_name,
+                )
+                if share_url:
+                    return share_url
+                if self._ticket_mode == "share":
+                    logger.error(
+                        "【123多盘STRM】分享票模式换取失败（原因见上方日志），"
+                        "请检查分享状态或切换回 VIP 直链模式"
+                    )
+                    return None
+                logger.warn(
+                    "【123多盘STRM】分享票换取失败，自动回退 VIP 直链模式"
+                )
+            # VIP 直链换链（以下为原逻辑）
             # 无文件标识时：秒传转存兜底（虚拟转存，不消耗空间）
             if not s3_key_flag:
                 if not md5 or not size:
@@ -209,6 +248,109 @@ class StrmHelper:
                     return acc
             logger.warn(f"【123多盘STRM】未找到网盘 {disk_name}，使用默认账号")
         return accounts[0]
+
+    # ==================== 分享票播放 ====================
+
+    def _resolve_share_ticket_url(
+        self,
+        name: str,
+        size: int,
+        md5: str,
+        user_agent: str,
+        disk_name: str = "",
+    ) -> Optional[str]:
+        """
+        分享票播放：md5 -> 分享转存记录 -> shareKey/FileId -> 分享下载票
+
+        流程：
+        1. 按 etag（md5）+ size 反查分享转存记录（分享重建后重新转存的
+           记录优先，因为新记录带新 FileId）
+        2. 老记录缺 FileId/S3KeyFlag 时，用 find_share_file 按 rel_path
+           实时定位分享内文件并回填数据库
+        3. 分享票换票 + 210 解析（缓存换票结果，过期按票 t 参数自动重换）
+
+        :return: 最终边缘下载 URL；失败返回 None（原因已记日志）
+        """
+        records = self._find_share_records(md5, size)
+        if not records:
+            logger.warn(
+                f"【123多盘STRM】分享票模式：文件 {name} 未找到分享转存记录"
+                "（仅通过分享转存入库的文件可用分享票播放）"
+            )
+            return None
+        account = self._pick_account(disk_name)
+        if not account:
+            logger.error("【123多盘STRM】没有可用的网盘账号，无法换取分享下载票")
+            return None
+        token = getattr(account.client, "token", "") or ""
+        for task, rec in records:
+            try:
+                file_id = rec.get("file_id") or ""
+                s3_flag = rec.get("share_s3_key_flag") or ""
+                if not file_id or not s3_flag:
+                    # 老版本转存记录：实时定位分享内文件并回填
+                    sf = task.find_share_file(rec.get("rel_path") or "")
+                    if not sf:
+                        logger.warn(
+                            f"【123多盘STRM】分享 {task.name} 内已找不到"
+                            f" {rec.get('rel_path')}（分享可能已失效/已重建），跳过"
+                        )
+                        continue
+                    file_id, s3_flag = sf.file_id, sf.s3_key_flag
+                    try:
+                        task._db.set_file_ids(
+                            rec.get("file_key"), file_id, s3_flag
+                        )
+                    except Exception:
+                        pass
+                url = get_share_download_url(
+                    token=token,
+                    share_key=task.share_key,
+                    share_pwd=task.share_pwd,
+                    file_id=file_id,
+                    s3_key_flag=s3_flag,
+                    etag=md5,
+                    size=size,
+                    user_agent=user_agent,
+                    cache=self._share_ticket_cache,
+                )
+                if url:
+                    logger.debug(
+                        f"【123多盘STRM】分享票播放地址: {url[:200]}"
+                    )
+                    return url
+                logger.warn(
+                    f"【123多盘STRM】分享 {task.name} 换票失败，尝试其他分享记录"
+                )
+            except Exception as e:
+                logger.warn(
+                    f"【123多盘STRM】分享 {task.name} 分享票换取异常: {e}"
+                )
+        return None
+
+    def _find_share_records(
+        self, md5: str, size: int
+    ) -> List[Tuple[Any, Dict]]:
+        """
+        反查分享转存记录（跨任务合并，优先带 FileId 的最新记录）
+
+        :return: [(ShareSync, record_dict), ...] 按可用性排序
+        """
+        result: List[Tuple[Any, Dict]] = []
+        for task in self._shares:
+            try:
+                for rec in task._db.find_by_etag(md5, size):
+                    result.append((task, rec))
+            except Exception as e:
+                logger.warn(f"【123多盘STRM】查询分享记录失败（{task.name}）: {e}")
+        result.sort(
+            key=lambda t: (
+                1 if t[1].get("file_id") and t[1].get("share_s3_key_flag") else 0,
+                t[1].get("created_at") or "",
+            ),
+            reverse=True,
+        )
+        return result
 
     # ==================== 全量同步 ====================
 

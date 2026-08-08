@@ -349,5 +349,160 @@ check(len(fake_d.last_download_bases) == 2,
 
 tool_mod.probe_download_url = _orig_probe
 
+# ============ 9. 分享票播放模式 ============
+print("== 9. 分享票播放模式 ==")
+import time as _time  # noqa: E402
+from pathlib import Path as _Path  # noqa: E402
+
+from P123DiskMulti.share import ShareSync  # noqa: E402
+from P123DiskMulti.share_ticket import ticket_ttl  # noqa: E402
+
+share_tmp = tempfile.mkdtemp(prefix="p123share_")
+api4 = P123MultiApi(disks=[], disk_name="123云盘")
+acc_e = make_account("盘E", 100 * 1024 ** 3, 50 * 1024 ** 3)
+api4._accounts = [acc_e]
+fake_e = acc_e.client._fake
+
+share_task = ShareSync(
+    api=api4,
+    task_id="T1",
+    name="分享1",
+    share_key="u9izjv-WeSWv",
+    share_pwd="Zee5",
+    target_vpath="/盘E/分享",
+    db_path=_Path(share_tmp) / "share.sqlite3",
+)
+# 转存记录（带分享侧 FileId/S3KeyFlag）
+share_task._db.add(
+    file_key="k1", task_id="T1", name="S01E240.2025.2160p.mp4",
+    rel_path="/电视剧/完美世界/S01E240.mp4", size=502475797,
+    etag="md5-share1", share_fp="fp1",
+    target_path="/盘E/分享/电视剧/完美世界/S01E240.mp4",
+    file_id="40123967", share_s3_key_flag="1830563249-0",
+)
+# 第二记录（分享失效测试用）
+share_task._db.add(
+    file_key="k2", task_id="T1", name="第二集.mkv",
+    rel_path="/电视剧/完美世界/第二集.mkv", size=300,
+    etag="md5-share2", share_fp="fp1",
+    target_path="/盘E/分享/电视剧/完美世界/第二集.mkv",
+    file_id="40123968", share_s3_key_flag="1830563249-0",
+)
+# 老记录（无 file_id，实时定位回填测试用）
+share_task._db.add(
+    file_key="k3", task_id="T1", name="老片.mkv",
+    rel_path="/电影/老片.mkv", size=200, etag="md5-old",
+    share_fp="fp1", target_path="/盘E/分享/电影/老片.mkv",
+)
+
+helper7 = StrmHelper(
+    api=api4, moviepilot_address="http://127.0.0.1:3000",
+    ticket_mode="share", shares=[share_task],
+)
+helper8 = StrmHelper(
+    api=api4, moviepilot_address="http://127.0.0.1:3000",
+    ticket_mode="auto", shares=[share_task],
+)
+
+# 9.1 分享票换票 + 210 解析
+_PAYLOAD = {
+    "shareKey": "u9izjv-WeSWv",
+    "sharePwd": "Zee5",
+    "fileId": 40123967,
+    "s3KeyFlag": "1830563249-0",
+    "etag": "md5-share1",
+    "size": 502475797,
+}
+tl._share_download_calls.clear()
+dl = helper7.resolve_download_url(
+    "S01E240.2025.2160p.mp4", 502475797, "md5-share1", "", disk_name="盘E"
+)
+check(dl == "http://edge.example/file", "分享票 210 解析返回边缘 URL")
+check(
+    len(tl._share_download_calls) == 1
+    and tl._share_download_calls[0]["json"] == _PAYLOAD,
+    f"换票载荷正确: {tl._share_download_calls[0]['json'] if tl._share_download_calls else None}",
+)
+
+# 9.2 票缓存：二次播放不再换票（仍做 210 解析）
+tl._share_download_calls.clear()
+dl = helper7.resolve_download_url(
+    "S01E240.2025.2160p.mp4", 502475797, "md5-share1", "", disk_name="盘E"
+)
+check(dl == "http://edge.example/file", "缓存命中仍返回边缘 URL")
+check(len(tl._share_download_calls) == 0, "缓存命中未再换票")
+
+# 9.3 分享票模式：无分享记录 → None
+_orig_probe2 = tool_mod.probe_download_url
+probe_queue = []  # 不应触发 VIP 换票
+probe_queue = [(True, 206, "")]
+dl = helper7.resolve_download_url("别的.mkv", 100, "md5-none", "s3x", disk_name="盘E")
+check(dl is None, "分享票模式无分享记录返回 None")
+check(len(probe_queue) == 1, "未走 VIP 通道")
+tool_mod.probe_download_url = _orig_probe2
+
+# 9.4 自动模式：无分享记录 → 回退 VIP 直链
+dl = helper8.resolve_download_url("别的.mkv", 100, "md5-none", "s3x", disk_name="盘E")
+check(dl == "http://download/1", "auto 模式无分享记录回退 VIP 直链")
+
+# 9.5 分享失效（code=400）→ None，日志可辨识
+tl.fake_post._response = {"code": 400, "message": "非法请求，源文件不存在"}
+dl = helper7.resolve_download_url(
+    "第二集.mkv", 300, "md5-share2", "", disk_name="盘E"
+)
+check(dl is None, "分享失效(code=400)返回 None")
+tl.fake_post._response = None
+
+# 9.6 需登录（code=5112）→ None
+tl.fake_post._response = {"code": 5112, "message": "您需要注册登录或付费后下载"}
+dl = helper7.resolve_download_url(
+    "第二集.mkv", 300, "md5-share2", "", disk_name="盘E"
+)
+check(dl is None, "需登录(code=5112)返回 None")
+tl.fake_post._response = None
+
+# 9.7 老记录无 file_id：按 rel_path 实时定位并回填
+fake_e.share_entries = {
+    0: [{"FileId": 55, "FileName": "电影", "Type": 1, "Size": 0,
+         "Etag": "", "S3KeyFlag": "", "ParentFileId": 0}],
+    55: [{"FileId": 777, "FileName": "老片.mkv", "Type": 0, "Size": 200,
+          "Etag": "md5-old", "S3KeyFlag": "111-0", "ParentFileId": 55}],
+}
+tl._share_download_calls.clear()
+dl = helper7.resolve_download_url("老片.mkv", 200, "md5-old", "", disk_name="盘E")
+check(dl == "http://edge.example/file", "老记录实时定位后换票成功")
+recs = share_task._db.find_by_etag("md5-old", 200)
+check(
+    recs and recs[0]["file_id"] == "777"
+    and recs[0]["share_s3_key_flag"] == "111-0",
+    "FileId/S3KeyFlag 已回填",
+)
+check(
+    tl._share_download_calls
+    and tl._share_download_calls[-1]["json"]["fileId"] == 777,
+    "换票使用定位到的 FileId",
+)
+
+# 9.8 分享通道风控（210 解析 403）：自动换票重试；解除后自动恢复
+tl.fake_get._share_210_403 = True
+tl._share_download_calls.clear()
+dl = helper7.resolve_download_url("老片.mkv", 200, "md5-old", "", disk_name="盘E")
+check(dl is None, "分享通道风控返回 None")
+tl.fake_get._share_210_403 = False
+dl = helper7.resolve_download_url("老片.mkv", 200, "md5-old", "", disk_name="盘E")
+check(dl == "http://edge.example/file", "风控解除后自动恢复")
+check(len(tl._share_download_calls) == 2, "风控期换新票 + 恢复后重新换票")
+
+# 9.9 票有效期（t 参数）换算
+check(
+    600 < ticket_ttl("http://x/?v=5&t=9999999999") <= 6 * 3600,
+    f"t 有效期换算正确: {ticket_ttl('http://x/?v=5&t=9999999999')}",
+)
+check(ticket_ttl("http://x/?v=5") == 600, "无 t 参数用默认 600")
+check(
+    ticket_ttl(f"http://x/?v=5&t={int(_time.time()) + 60}") == 0,
+    "t 余量不足 5 分钟不缓存",
+)
+
 print(f"\n结果: {passed} 通过, {failed} 失败")
 sys.exit(1 if failed else 0)

@@ -76,12 +76,31 @@ class ShareDB:
                 share_fp TEXT NOT NULL,
                 target_path TEXT NOT NULL DEFAULT '',
                 status TEXT NOT NULL DEFAULT 'done',
-                created_at TEXT NOT NULL
+                created_at TEXT NOT NULL,
+                file_id TEXT NOT NULL DEFAULT '',
+                share_s3_key_flag TEXT NOT NULL DEFAULT ''
             )
             """
         )
+        # 兼容旧库（v1.4.5 起记录分享文件 FileId/S3KeyFlag，供分享票播放模式使用）
+        cols = {
+            row[1]
+            for row in self._conn.execute("PRAGMA table_info(share_files)")
+        }
+        if "file_id" not in cols:
+            self._conn.execute(
+                "ALTER TABLE share_files ADD COLUMN file_id TEXT NOT NULL DEFAULT ''"
+            )
+        if "share_s3_key_flag" not in cols:
+            self._conn.execute(
+                "ALTER TABLE share_files ADD COLUMN share_s3_key_flag TEXT NOT NULL DEFAULT ''"
+            )
         self._conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_share_task ON share_files(task_id)"
+        )
+        # 分享票模式按 etag 反查分享记录（STRM 播放热路径，必须有索引）
+        self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_share_etag ON share_files(etag, size)"
         )
         self._conn.commit()
 
@@ -104,6 +123,8 @@ class ShareDB:
         share_fp: str,
         target_path: str,
         status: str = "done",
+        file_id: str = "",
+        share_s3_key_flag: str = "",
     ) -> None:
         """写入转存记录（幂等，存在则更新）。"""
         with self._lock:
@@ -111,16 +132,20 @@ class ShareDB:
                 """
                 INSERT INTO share_files
                     (file_key, task_id, name, rel_path, size, etag,
-                     share_fp, target_path, status, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     share_fp, target_path, status, created_at,
+                     file_id, share_s3_key_flag)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(file_key) DO UPDATE SET
                     status = excluded.status,
-                    target_path = excluded.target_path
+                    target_path = excluded.target_path,
+                    file_id = excluded.file_id,
+                    share_s3_key_flag = excluded.share_s3_key_flag
                 """,
                 (
                     file_key, task_id, name, rel_path, int(size or 0),
                     etag, share_fp, target_path, status,
                     datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    str(file_id or ""), str(share_s3_key_flag or ""),
                 ),
             )
             self._conn.commit()
@@ -149,6 +174,55 @@ class ShareDB:
                 }
                 for r in rows
             ]
+
+    def find_by_etag(
+        self, etag: str, size: Optional[int] = None, task_id: str = ""
+    ) -> List[Dict[str, Any]]:
+        """
+        按文件内容标识（etag，即 md5）反查分享转存记录
+
+        分享票播放模式使用：STRM 携带 md5，需反查其来源分享
+        （FileId/S3KeyFlag/share 配置）。按创建时间倒序，分享重建后
+        重新转存的记录（新 FileId）优先命中。
+        """
+        sql = (
+            "SELECT file_key, task_id, name, rel_path, size, etag, "
+            "share_fp, target_path, status, created_at, "
+            "file_id, share_s3_key_flag "
+            "FROM share_files WHERE etag = ?"
+        )
+        args: List[Any] = [str(etag or "")]
+        if size:
+            sql += " AND size = ?"
+            args.append(int(size))
+        if task_id:
+            sql += " AND task_id = ?"
+            args.append(task_id)
+        sql += " ORDER BY created_at DESC, rowid DESC LIMIT 20"
+        with self._lock:
+            rows = self._conn.execute(sql, tuple(args)).fetchall()
+        return [
+            {
+                "file_key": r[0], "task_id": r[1], "name": r[2],
+                "rel_path": r[3], "size": r[4], "etag": r[5],
+                "share_fp": r[6], "target_path": r[7], "status": r[8],
+                "created_at": r[9], "file_id": r[10],
+                "share_s3_key_flag": r[11],
+            }
+            for r in rows
+        ]
+
+    def set_file_ids(
+        self, file_key: str, file_id: str, share_s3_key_flag: str
+    ) -> None:
+        """回填分享文件 FileId/S3KeyFlag（老记录实时定位后使用）。"""
+        with self._lock:
+            self._conn.execute(
+                "UPDATE share_files SET file_id = ?, share_s3_key_flag = ? "
+                "WHERE file_key = ?",
+                (str(file_id or ""), str(share_s3_key_flag or ""), file_key),
+            )
+            self._conn.commit()
 
     def drop(self, file_key: str) -> None:
         """删除记录（pending 确认失败后重新转存前调用）。"""
@@ -441,6 +515,119 @@ class ShareSync:
         return result
 
     # ==================== 内容检查 ====================
+
+    def find_share_file(self, rel_path: str) -> Optional[ShareFile]:
+        """
+        按分享内路径实时定位文件（分享票模式兜底）
+
+        老版本转存记录缺 file_id/S3KeyFlag 时使用：逐级 share_fs_list
+        只遍历目标路径上的目录（不递归整棵分享树），找到即返回。
+
+        :param rel_path: 分享内路径（/ 开头，与转存记录 rel_path 一致）
+        :return: ShareFile（is_dir 为 False）；未找到/分享不可访问返回 None
+        """
+        rel = str(rel_path or "").strip().lstrip("/")
+        if not rel:
+            return None
+        segments = rel.split("/")
+        try:
+            client = self._client()
+        except Exception as e:
+            logger.warn(f"【123多盘】分享 {self.name} 客户端不可用: {e}")
+            return None
+        parent_id = 0
+        for idx, seg in enumerate(segments):
+            last = idx == len(segments) - 1
+            page = 1
+            found: Optional[ShareFile] = None
+            while True:
+                try:
+                    resp = client.share_fs_list(
+                        {
+                            "ShareKey": self.share_key,
+                            "SharePwd": self.share_pwd,
+                            "parentFileId": parent_id,
+                            "limit": SHARE_PAGE_SIZE,
+                            "Page": page,
+                        }
+                    )
+                    check_response(resp)
+                except Exception as e:
+                    logger.warn(
+                        f"【123多盘】分享 {self.name} 定位文件 {rel_path} 失败: {e}"
+                    )
+                    return None
+                data = resp.get("data") or {}
+                if not isinstance(data, dict):
+                    break
+                items = (
+                    data.get("InfoList")
+                    or data.get("infoList")
+                    or data.get("list")
+                    or []
+                )
+                if not items:
+                    break
+                for raw in items:
+                    try:
+                        name = self._safe_name(
+                            raw.get("FileName")
+                            or raw.get("name")
+                            or raw.get("file_name")
+                            or ""
+                        )
+                    except ValueError:
+                        continue
+                    if name != seg:
+                        continue
+                    is_dir = str(raw.get("Type", 0)) in ("1", "True") or bool(
+                        raw.get("is_dir")
+                    )
+                    item = ShareFile(
+                        file_id=str(
+                            raw.get("FileId")
+                            or raw.get("file_id")
+                            or raw.get("id")
+                            or ""
+                        ),
+                        name=name,
+                        path="/" + "/".join(segments[:idx + 1]),
+                        is_dir=is_dir,
+                        size=int(raw.get("Size") or raw.get("size") or 0),
+                        etag=str(
+                            raw.get("Etag")
+                            or raw.get("etag")
+                            or raw.get("md5")
+                            or ""
+                        ),
+                        s3_key_flag=str(
+                            raw.get("S3KeyFlag")
+                            or raw.get("s3_key_flag")
+                            or ""
+                        ),
+                        parent_file_id=str(
+                            raw.get("ParentFileId")
+                            or raw.get("parent_file_id")
+                            or "0"
+                        ),
+                        raw=dict(raw),
+                    )
+                    if last:
+                        return item if not is_dir else None
+                    found = item
+                    break
+                if found is not None:
+                    break
+                if len(items) < SHARE_PAGE_SIZE or str(data.get("Next") or "") == "-1":
+                    break
+                page += 1
+            if found is None:
+                logger.warn(
+                    f"【123多盘】分享 {self.name} 内未找到路径 {rel_path}（分享可能已失效/已重建）"
+                )
+                return None
+            parent_id = found.file_id
+        return None
 
     def check(self) -> Dict[str, Any]:
         """
@@ -745,6 +932,9 @@ class ShareSync:
                 share_fp=self._share_fp,
                 target_path=target,
                 status=status,
+                # 分享票播放模式需要分享侧文件标识
+                file_id=f.file_id,
+                share_s3_key_flag=f.s3_key_flag,
             )
         if confirmed_keys:
             # 转存占用目标盘空间，刷新空间缓存

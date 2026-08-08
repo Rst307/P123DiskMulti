@@ -172,6 +172,8 @@ P123MultiApi = _p123_api.P123MultiApi
 class FakeP123Client:
     """模拟单个123账号：内存文件树 + 空间"""
 
+    token = "fake-token"
+
     def __init__(self, total, used):
         self.total = total
         self.used = used
@@ -344,10 +346,12 @@ class FakeP123Client:
 
 # 模拟 requests.get（下载）
 class FakeResp:
-    def __init__(self, data, status_code=206):
+    def __init__(self, data, status_code=206, json_data=None, headers=None):
         self._data = data
         self.status_code = status_code
         self.text = str(data)[:200]
+        self._json = json_data
+        self.headers = headers or {}
 
     def __enter__(self):
         return self
@@ -359,6 +363,8 @@ class FakeResp:
         pass
 
     def json(self):
+        if self._json is not None:
+            return self._json
         raise ValueError("not json")
 
     def close(self):
@@ -376,6 +382,17 @@ _fake_clients = []
 
 
 def fake_get(url, stream=True, **kwargs):
+    if str(url).startswith("http://share-cdn"):
+        # 分享票 210 解析：网关返回重定向 JSON（可切换为风控 403）
+        if getattr(fake_get, "_share_210_403", False):
+            return FakeResp(
+                b"", status_code=403,
+                json_data={"message": "download err: 50002", "code": 1010},
+            )
+        return FakeResp(
+            b"", status_code=210,
+            json_data={"code": 0, "data": {"redirect_url": "http://edge.example/file"}},
+        )
     headers = kwargs.get("headers") or {}
     if headers.get("Range"):
         # 下载票探测请求（Range 首字节）：不消费下载内容状态，直接返回 206
@@ -386,6 +403,29 @@ def fake_get(url, stream=True, **kwargs):
             fake.pending_download_file_id = None
             return FakeResp(data)
     return FakeResp(b"")
+
+
+# 分享票换票（share/download/info）桩：记录调用，可配置响应
+_share_download_calls = []
+
+
+def fake_post(url, **kwargs):
+    _share_download_calls.append({"url": url, "json": kwargs.get("json") or {}})
+    response = getattr(fake_post, "_response", None)
+    if response is None:
+        import base64 as _b64
+        inner = (
+            "http://share-cdn.example/ticket?v=5"
+            "&t=9999999999&r=abc&bzs=00&ur=vpngvaegvngvnp"
+        )
+        params = _b64.b64encode(inner.encode("utf-8")).decode("utf-8")
+        response = {
+            "code": 0,
+            "data": {
+                "DownloadURL": f"https://web-pro2.123952.com/download-v2/?params={params}"
+            },
+        }
+    return FakeResp(response, status_code=200, json_data=response)
 
 
 # 让 DiskAccount 使用我们的假客户端
@@ -445,6 +485,7 @@ def check(cond, msg):
 
 
 _p123_api.requests.get = fake_get
+_p123_api.requests.post = fake_post
 
 
 def _run_tests():
