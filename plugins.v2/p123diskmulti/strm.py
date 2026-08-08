@@ -95,7 +95,7 @@ class StrmHelper:
         except (TypeError, ValueError):
             self._download_cache_ttl = 600
         # 播放票模式：vip=VIP直链（默认，兼容旧行为）| share=分享票 |
-        # auto=分享票优先+VIP兜底 | on_demand=按需分享（播放时懒建带有效期分享）
+        # auto=分享票优先+VIP兜底+按需分享三级兜底 | on_demand=按需分享（播放时懒建带有效期分享）
         self._ticket_mode = str(ticket_mode or "vip").strip().lower()
         if self._ticket_mode not in ("vip", "share", "auto", "on_demand"):
             self._ticket_mode = "vip"
@@ -178,7 +178,8 @@ class StrmHelper:
         - vip：VIP 直链换链（默认，支持域名风控自动切换）
         - share：分享票（share/download/info），多 IP 播放为分享设计内行为，
           不受 VIP 通道风控影响；仅分享转存入库的文件可用
-        - auto：分享票优先，失败自动回退 VIP 直链
+        - auto：分享票优先，失败自动回退 VIP 直链，再失败按需分享兜底
+          （按 md5+size 定位原文件懒建单文件分享，任何在网盘里的文件都能放）
 
         :return: 下载地址，失败返回 None
         """
@@ -262,17 +263,44 @@ class StrmHelper:
                 probe=self._download_probe,
                 cache_ttl=self._download_cache_ttl,
             )
-            if not url:
-                logger.error(
-                    "【123多盘STRM】换取下载地址失败（所有换链通道被风控或不可用），"
-                    "请查看插件日志确认 123 账号状态"
-                )
-                return None
-            logger.debug(f"【123多盘STRM】获取下载地址成功: {url}")
-            return url
+            if url:
+                logger.debug(f"【123多盘STRM】获取下载地址成功: {url}")
+                return url
+            logger.error(
+                "【123多盘STRM】换取下载地址失败（所有换链通道被风控或不可用），"
+                "请查看插件日志确认 123 账号状态"
+            )
         except Exception as e:
             logger.error(f"【123多盘STRM】获取下载地址失败: {e}")
+            if self._ticket_mode != "auto":
+                return None
+        # 自动模式最后兜底：按需分享（懒建带有效期单文件分享，定位原文件直接分享）
+        if self._ticket_mode == "auto":
+            logger.warn("【123多盘STRM】VIP 直链失败，自动回退按需分享（懒建单文件分享）")
+            try:
+                url = get_on_demand_share_url(
+                    account,
+                    disk_name=disk_name,
+                    name=name,
+                    md5=md5,
+                    size=int(size or 0),
+                    ttl_days=self._on_demand_share_days,
+                    share_pwd=self._on_demand_share_pwd,
+                    user_agent=user_agent or DEFAULT_UA,
+                    ticket_cache=self._share_ticket_cache,
+                    share_cache=self._on_demand_share_cache,
+                )
+                if url:
+                    logger.warn("【123多盘STRM】按需分享兜底播放成功")
+                    return url
+            except Exception as e2:
+                logger.error(f"【123多盘STRM】按需分享兜底异常: {e2}")
+            logger.error(
+                "【123多盘STRM】自动模式全部通道失败（分享票/VIP/按需分享），"
+                "详见上方日志，或切换回 VIP 直链模式"
+            )
             return None
+        return None
 
     def _pick_account(self, disk_name: str = ""):
         """

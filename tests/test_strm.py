@@ -752,7 +752,53 @@ check(dl == "http://edge.example/file", "根目录存在同名文件时播放成
 check(len(fake_g.entries) == entries_before, "播放后网盘条目数不变（不重复复制）")
 check(len(fake_g.upload_request_calls) == 0, "同名场景同样不调用秒传")
 
-# 11.7 建分享接口失败：返回 None（先清缓存确保走到建分享路径）
+# 11.7 auto 模式三级兜底：分享记录失效（分享内找不到路径）+ VIP 风控
+#     -> 按需分享定位原文件兜底播放（用户当前场景：分享 完美世界 内未找到路径）
+stale_task = ShareSync(
+    api=api6,
+    task_id="ST1",
+    name="完美世界",
+    share_key="stale-key",
+    share_pwd="",
+    target_vpath="/盘G/分享",
+    db_path=_Path(share_tmp) / "stale.sqlite3",
+)
+# 老记录：无 file_id，分享内已找不到 rel_path（分享已重建/失效）
+stale_task._db.add(
+    file_key="ks1", task_id="ST1", name="MOV.A.mkv",
+    rel_path="/旧路径/老片.mkv", size=999, etag="md5-ond",
+    share_fp="fp-stale", target_path="/盘G/分享/旧路径/老片.mkv",
+)
+helper14 = StrmHelper(
+    api=api6, moviepilot_address="http://127.0.0.1:3000",
+    ticket_mode="auto", shares=[stale_task],
+)
+_orig_probe3 = tool_mod.probe_download_url
+probe_queue = [
+    (False, 403, "message=download err: 50002 code=1010"),
+    (False, 403, "message=download err: 50002 code=1010"),
+]  # VIP 两个候选域名均被风控
+
+
+def _fake_probe3(url, headers=None, timeout=8):
+    return probe_queue.pop(0)
+
+
+tool_mod.probe_download_url = _fake_probe3
+fake_g.share_create_calls.clear()
+entries_before = len(fake_g.entries)
+dl = helper14.resolve_download_url("MOV.A.mkv", 999, "md5-ond", "s3", disk_name="盘G")
+tool_mod.probe_download_url = _orig_probe3
+check(dl == "http://edge.example/file", "分享失效+VIP风控时按需分享兜底播放成功")
+check(len(probe_queue) == 0, f"VIP 通道确实被尝试（探测已消费）: {len(probe_queue)}")
+check(
+    fake_g.share_create_calls
+    and fake_g.share_create_calls[0]["payload"]["fileIdList"] == str(loc_id),
+    "兜底分享指向网盘原文件",
+)
+check(len(fake_g.entries) == entries_before, "兜底播放后网盘条目数不变")
+
+# 11.8 建分享接口失败：返回 None（先清缓存确保走到建分享路径）
 helper12._on_demand_share_cache.take(key_od)
 fake_g.fail_share_create = True
 fake_g.share_create_calls.clear()
@@ -760,7 +806,7 @@ dl = helper12.resolve_download_url("MOV.A.mkv", 999, "md5-ond", "", disk_name="�
 check(dl is None, "建分享失败返回 None")
 fake_g.fail_share_create = False
 
-# 11.8 分享票通道 403 风控：缓存复用失败 -> 取消旧分享重建一次，恢复后自愈
+# 11.9 分享票通道 403 风控：缓存复用失败 -> 取消旧分享重建一次，恢复后自愈
 fake_g.share_create_calls.clear()
 fake_g.share_cancel_calls.clear()
 helper12._on_demand_share_cache.take(key_od)  # 用 11.3 留下的分享缓存
@@ -776,7 +822,7 @@ tl.fake_get._share_210_403 = False
 dl = helper12.resolve_download_url("MOV.A.mkv", 999, "md5-ond", "", disk_name="盘G")
 check(dl == "http://edge.example/file", "风控恢复后播放自愈")
 
-# 11.9 自定义有效期（1 天）+ 提取码
+# 11.10 自定义有效期（1 天）+ 提取码
 helper13 = StrmHelper(
     api=api6, moviepilot_address="http://127.0.0.1:3000",
     ticket_mode="on_demand",
@@ -798,7 +844,7 @@ check(
     "自定义提取码写入分享",
 )
 
-# 11.10 独立函数冒烟：OnDemandShareCache 上限与逐出
+# 11.11 独立函数冒烟：OnDemandShareCache 上限与逐出
 odc = OnDemandShareCache(maxsize=2)
 odc.set(("a", "m1", 1), {"share_id": "s1", "expired_at": time.time() + 10})
 odc.set(("a", "m2", 2), {"share_id": "s2", "expired_at": time.time() + 20})

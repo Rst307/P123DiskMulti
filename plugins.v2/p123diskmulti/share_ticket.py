@@ -485,7 +485,7 @@ def _search_file(
                 continue  # 目录
             if int(it.get("Size") or 0) != int(size or 0):
                 continue
-            if str(it.get("Etag") or "") != str(md5 or ""):
+            if str(it.get("Etag") or "").lower() != str(md5 or "").lower():
                 continue
             file_id = it.get("FileId") or it.get("fileId") or it.get("FileID")
             if not file_id:
@@ -544,7 +544,7 @@ def _walk_find_file(client, md5: str, size):
                     continue
                 if int(it.get("Size") or 0) != size:
                     continue
-                if str(it.get("Etag") or "") != str(md5 or ""):
+                if str(it.get("Etag") or "").lower() != str(md5 or "").lower():
                     continue
                 file_id = it.get("FileId") or it.get("fileId") or it.get("FileID")
                 if not file_id:
