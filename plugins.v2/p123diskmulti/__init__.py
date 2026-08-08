@@ -76,8 +76,11 @@ class P123DiskMulti(_PluginBase):
         self._download_probe = True
         # 已验证下载直链缓存秒数（降低签票频率，防止风控触发）
         self._download_cache_ttl = 600
-        # 播放票模式：vip | share | auto
+        # 播放票模式：vip | share | auto | on_demand
         self._ticket_mode = "vip"
+        # 按需分享：播放时懒建带有效期分享（天）+ 提取码
+        self._on_demand_share_days = 7
+        self._on_demand_share_pwd = ""
         # 分享增量同步任务
         self._shares: List[ShareSync] = []
         # 自分享目录（把自己网盘的目录建成分享，STRM 播放走分享票）
@@ -132,8 +135,17 @@ class P123DiskMulti(_PluginBase):
 
             # 播放票模式（vip=VIP直链 | share=分享票 | auto=分享票优先+VIP兜底）
             self._ticket_mode = str(config.get("ticket_mode") or "vip").strip().lower()
-            if self._ticket_mode not in ("vip", "share", "auto"):
+            if self._ticket_mode not in ("vip", "share", "auto", "on_demand"):
                 self._ticket_mode = "vip"
+            try:
+                self._on_demand_share_days = int(
+                    config.get("on_demand_share_days") or 7
+                )
+            except (TypeError, ValueError):
+                self._on_demand_share_days = 7
+            self._on_demand_share_pwd = str(
+                config.get("on_demand_share_pwd") or ""
+            )
 
             # 分享增量同步配置
             self._share_enabled = config.get("share_enabled", False)
@@ -205,6 +217,8 @@ class P123DiskMulti(_PluginBase):
             download_probe=self._download_probe,
             download_cache_ttl=self._download_cache_ttl,
             ticket_mode=self._ticket_mode,
+            on_demand_share_days=self._on_demand_share_days,
+            on_demand_share_pwd=self._on_demand_share_pwd,
             shares=self._shares,
             self_share=self._self_share,
         )
@@ -1134,8 +1148,43 @@ class P123DiskMulti(_PluginBase):
                                                     "title": "自动（分享票优先，失败回退 VIP）",
                                                     "value": "auto",
                                                 },
+                                                {
+                                                    "title": "按需分享（懒建分享，自动过期）",
+                                                    "value": "on_demand",
+                                                },
                                             ],
-                                            "hint": "VIP 直链：账号直链换链，带域名风控自动切换；分享票：通过分享下载票播放（多 IP 播放为分享设计内行为，不受账号 VIP 通道风控影响；来源必须是「自分享目录服务」的目录或「分享增量同步」转存入库的文件）；自动：分享票优先、失败自动回退 VIP",
+                                            "hint": "VIP 直链：账号直链换链，带域名风控自动切换；分享票：通过已有分享下载票播放（来源必须是「自分享目录服务」的目录或「分享增量同步」转存入库的文件）；按需分享：播放时自动为文件创建带有效期的单文件分享（任何自己上传/转存的文件均可，免建目录分享/免索引）；自动：分享票优先、失败自动回退 VIP",
+                                            "persistent-hint": True,
+                                        },
+                                    }
+                                ],
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 4},
+                                "content": [
+                                    {
+                                        "component": "VTextField",
+                                        "props": {
+                                            "model": "on_demand_share_days",
+                                            "label": "按需分享有效期（天）",
+                                            "type": "number",
+                                            "hint": "按需分享模式下，播放时自动建的分享有效天数（默认 7 天）；到期后 123 自动回收，下次播放自动重建",
+                                            "persistent-hint": True,
+                                        },
+                                    }
+                                ],
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 8},
+                                "content": [
+                                    {
+                                        "component": "VTextField",
+                                        "props": {
+                                            "model": "on_demand_share_pwd",
+                                            "label": "按需分享提取码（可选）",
+                                            "hint": "留空则自动建的分享无提取码（播放链路自动换票，无需人工输入）；填写后分享需提取码才能下载",
                                             "persistent-hint": True,
                                         },
                                     }
@@ -1616,6 +1665,8 @@ class P123DiskMulti(_PluginBase):
             "download_probe": True,
             "download_cache_ttl": 600,
             "ticket_mode": "vip",
+            "on_demand_share_days": 7,
+            "on_demand_share_pwd": "",
             # 分享增量同步默认配置
             "share_enabled": False,
             "shares_text": "",
@@ -1880,7 +1931,7 @@ class P123DiskMulti(_PluginBase):
                             if self._download_cache_ttl > 0
                             else "，直链缓存关闭"
                         )
-                        + f"，播放票: {'VIP直链' if self._ticket_mode == 'vip' else '分享票' if self._ticket_mode == 'share' else '自动(分享票优先)'}"
+                        + f"，播放票: {'VIP直链' if self._ticket_mode == 'vip' else '分享票' if self._ticket_mode == 'share' else '按需分享' if self._ticket_mode == 'on_demand' else '自动(分享票优先)'}"
                     ),
                 }
             )

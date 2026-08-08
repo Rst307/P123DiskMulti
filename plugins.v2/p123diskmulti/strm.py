@@ -28,7 +28,12 @@ from p123client import check_response
 from app.log import logger
 from app.schemas import FileItem
 
-from .share_ticket import ShareTicketCache, get_share_download_url
+from .share_ticket import (
+    OnDemandShareCache,
+    ShareTicketCache,
+    get_on_demand_share_url,
+    get_share_download_url,
+)
 
 # 默认媒体扩展名（与 p123strmhelper 保持一致）
 DEFAULT_MEDIA_EXTS = [
@@ -67,6 +72,8 @@ class StrmHelper:
         ticket_mode: str = "vip",
         shares: Optional[list] = None,
         self_share=None,
+        on_demand_share_days: int = 7,
+        on_demand_share_pwd: str = "",
     ):
         self._api = api
         self._moviepilot_address = str(moviepilot_address or "").rstrip("/")
@@ -87,16 +94,25 @@ class StrmHelper:
             self._download_cache_ttl = int(download_cache_ttl or 0)
         except (TypeError, ValueError):
             self._download_cache_ttl = 600
-        # 播放票模式：vip=VIP直链（默认，兼容旧行为）| share=分享票 | auto=分享票优先+VIP兜底
+        # 播放票模式：vip=VIP直链（默认，兼容旧行为）| share=分享票 |
+        # auto=分享票优先+VIP兜底 | on_demand=按需分享（播放时懒建带有效期分享）
         self._ticket_mode = str(ticket_mode or "vip").strip().lower()
-        if self._ticket_mode not in ("vip", "share", "auto"):
+        if self._ticket_mode not in ("vip", "share", "auto", "on_demand"):
             self._ticket_mode = "vip"
+        # 按需分享：有效期天数与提取码（懒建分享自动过期，到期重建）
+        try:
+            self._on_demand_share_days = int(on_demand_share_days or 7)
+        except (TypeError, ValueError):
+            self._on_demand_share_days = 7
+        self._on_demand_share_pwd = str(on_demand_share_pwd or "")
         # 分享任务列表（分享票模式：md5 -> 分享记录 -> shareKey/FileId 反查用）
         self._shares = list(shares or [])
         # 自分享目录管理器（自己分享自己的文件，分享票播放）
         self._self_share = self_share
         # 分享票缓存（只缓存换票结果，每次播放仍做一次 210 解析）
         self._share_ticket_cache = ShareTicketCache()
+        # 按需分享元数据缓存（分享到期自动重建）
+        self._on_demand_share_cache = OnDemandShareCache()
         # 全量同步防重入锁
         self._sync_lock = threading.Lock()
         # 后台同步状态（start_full_sync 更新，sync_status 读取）
@@ -192,6 +208,27 @@ class StrmHelper:
                 logger.warn(
                     "【123多盘STRM】分享票换取失败，自动回退 VIP 直链模式"
                 )
+            # 按需分享模式：播放时懒建带有效期分享（不依赖任何预建分享/索引）
+            if self._ticket_mode == "on_demand":
+                url = get_on_demand_share_url(
+                    account,
+                    disk_name=disk_name,
+                    name=name,
+                    md5=md5,
+                    size=int(size or 0),
+                    ttl_days=self._on_demand_share_days,
+                    share_pwd=self._on_demand_share_pwd,
+                    user_agent=user_agent or DEFAULT_UA,
+                    ticket_cache=self._share_ticket_cache,
+                    share_cache=self._on_demand_share_cache,
+                )
+                if not url:
+                    logger.error(
+                        "【123多盘STRM】按需分享模式换取失败（原因见上方日志），"
+                        "请稍后重试或切换回 VIP 直链模式"
+                    )
+                    return None
+                return url
             # VIP 直链换链（以下为原逻辑）
             # 无文件标识时：秒传转存兜底（虚拟转存，不消耗空间）
             if not s3_key_flag:

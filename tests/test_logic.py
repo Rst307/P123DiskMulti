@@ -193,6 +193,8 @@ class FakeP123Client:
         self.share_cancel_calls = []
         self.fail_share_create = False
         self.fail_share_fs_list_once = False
+        # 按需分享（OnDemand 测试用）
+        self.upload_request_calls = []
 
     def _new_id(self):
         self.next_id += 1
@@ -270,7 +272,8 @@ class FakeP123Client:
         return {"code": 0, "data": {}}
 
     # ---- 上传 ----
-    def upload_request(self, payload):
+    def upload_request(self, payload, base_url="", **kwargs):
+        self.upload_request_calls.append({"payload": dict(payload), "base_url": base_url})
         etag = payload.get("etag")
         # 秒传：文件已存在
         for e in self.entries.values():

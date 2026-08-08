@@ -617,5 +617,148 @@ dl = helper11.resolve_download_url(
 )
 check(dl == "http://download/1", "无自分享记录时 auto 回退 VIP 直链")
 
+# ============ 11. 按需分享模式（播放时懒建带有效期分享） ============
+print("== 11. 按需分享（懒建分享） ==")
+from P123DiskMulti.share_ticket import (  # noqa: E402
+    ON_DEMAND_API_BASE,
+    OnDemandShareCache,
+    get_on_demand_share_url,
+)
+
+api6 = P123MultiApi(disks=[], disk_name="123云盘")
+acc_g = make_account("盘G", 100 * 1024 ** 3, 10 * 1024 ** 3)
+api6._accounts = [acc_g]
+fake_g = acc_g.client._fake
+
+# 网盘内已存在的文件（直接上传/转存均可，无需任何分享记录）
+fake_g._entry("MOV.A.mkv", 0, "file", size=999, etag="md5-ond")
+fake_g._entry("SUB.srt", 0, "file", size=123, etag="md5-sub")
+
+# 11.1 首次播放：秒传定位 -> 建分享（带有效期）-> 换票 -> 边缘 URL
+helper12 = StrmHelper(
+    api=api6, moviepilot_address="http://127.0.0.1:3000",
+    ticket_mode="on_demand",
+)
+fake_g.upload_request_calls.clear()
+fake_g.share_create_calls.clear()
+tl._share_download_calls.clear()
+dl = helper12.resolve_download_url("MOV.A.mkv", 999, "md5-ond", "", disk_name="盘G")
+check(dl == "http://edge.example/file", f"按需分享首次播放成功: {dl}")
+check(
+    fake_g.upload_request_calls
+    and fake_g.upload_request_calls[0]["payload"]["etag"] == "md5-ond"
+    and fake_g.upload_request_calls[0]["payload"]["size"] == 999
+    and fake_g.upload_request_calls[0]["base_url"] == ON_DEMAND_API_BASE,
+    "秒传定位：md5+size 且走 api.123278.com/b 通道",
+)
+check(len(fake_g.share_create_calls) == 1, "自动建分享一次")
+loc_id = [
+    e["FileId"] for e in fake_g.entries.values()
+    if e["FileName"] == "MOV.A.mkv"
+][0]
+sp = fake_g.share_create_calls[0]["payload"]
+check(
+    sp["fileIdList"] == str(loc_id) and sp["sharePwd"] == ""
+    and sp["fillPwdSwitch"] == 0
+    and fake_g.share_create_calls[0]["base_url"] == ON_DEMAND_API_BASE,
+    f"建分享参数：fileIdList={sp.get('fileIdList')} 免提取码 走 api.123278.com/b",
+)
+import datetime as _dt
+exp = _dt.datetime.strptime(sp["expiration"], "%Y-%m-%dT%H:%M:%S+08:00")
+now_dt = _dt.datetime.now()
+check(
+    (exp - now_dt) > _dt.timedelta(days=6)
+    and (exp - now_dt) < _dt.timedelta(days=8),
+    f"有效期默认 7 天: {sp['expiration']}",
+)
+check(
+    tl._share_download_calls
+    and tl._share_download_calls[0]["json"]["shareKey"] == fake_g.shares[-1]["ShareKey"],
+    "换票使用自动创建的分享",
+)
+
+# 11.2 有效期内再次播放：不重新建分享（缓存复用）
+fake_g.share_create_calls.clear()
+dl = helper12.resolve_download_url("MOV.A.mkv", 999, "md5-ond", "", disk_name="盘G")
+check(dl == "http://edge.example/file", "有效期内二次播放成功")
+check(len(fake_g.share_create_calls) == 0, "有效期内复用分享，不重复建分享")
+
+# 11.3 分享到期：自动取消旧分享并重建
+key_od = ("盘G", "md5-ond", 999)
+od_rec = helper12._on_demand_share_cache.take(key_od)
+od_rec["expired_at"] = time.time() - 1  # 模拟已到期
+helper12._on_demand_share_cache.set(key_od, od_rec)
+fake_g.share_cancel_calls.clear()
+fake_g.share_create_calls.clear()
+old_id = od_rec["share_id"]
+dl = helper12.resolve_download_url("MOV.A.mkv", 999, "md5-ond", "", disk_name="盘G")
+check(dl == "http://edge.example/file", "到期后重建分享播放成功")
+check(
+    len(fake_g.share_cancel_calls) == 1
+    and str(fake_g.share_cancel_calls[0]["payload"]) == str(old_id),
+    f"到期自动取消旧分享: {fake_g.share_cancel_calls}",
+)
+check(len(fake_g.share_create_calls) == 1, "到期后重新建分享")
+
+# 11.4 文件不在网盘（定位失败）：返回 None，不建分享
+fake_g.share_create_calls.clear()
+dl = helper12.resolve_download_url("GHOST.mkv", 12345, "md5-ghost", "", disk_name="盘G")
+check(dl is None, "定位失败返回 None")
+check(len(fake_g.share_create_calls) == 0, "定位失败不建分享")
+
+# 11.5 建分享接口失败：返回 None（先清缓存确保走到建分享路径）
+helper12._on_demand_share_cache.take(key_od)
+fake_g.fail_share_create = True
+fake_g.share_create_calls.clear()
+dl = helper12.resolve_download_url("MOV.A.mkv", 999, "md5-ond", "", disk_name="盘G")
+check(dl is None, "建分享失败返回 None")
+fake_g.fail_share_create = False
+
+# 11.6 分享票通道 403 风控：缓存复用失败 -> 取消旧分享重建一次，恢复后自愈
+fake_g.share_create_calls.clear()
+fake_g.share_cancel_calls.clear()
+helper12._on_demand_share_cache.take(key_od)  # 用 11.3 留下的分享缓存
+helper12._on_demand_share_cache.set(key_od, od_rec)  # 重新放入（未过期）
+tl.fake_get._share_210_403 = True
+dl = helper12.resolve_download_url("MOV.A.mkv", 999, "md5-ond", "", disk_name="盘G")
+check(dl is None, "通道风控时返回 None")
+check(
+    len(fake_g.share_create_calls) == 1 and len(fake_g.share_cancel_calls) == 1,
+    f"风控时取消旧分享并重建一次: create={len(fake_g.share_create_calls)} cancel={len(fake_g.share_cancel_calls)}",
+)
+tl.fake_get._share_210_403 = False
+dl = helper12.resolve_download_url("MOV.A.mkv", 999, "md5-ond", "", disk_name="盘G")
+check(dl == "http://edge.example/file", "风控恢复后播放自愈")
+
+# 11.7 自定义有效期（1 天）+ 提取码
+helper13 = StrmHelper(
+    api=api6, moviepilot_address="http://127.0.0.1:3000",
+    ticket_mode="on_demand",
+    on_demand_share_days=1,
+    on_demand_share_pwd="pwd123",
+)
+fake_g.share_create_calls.clear()
+dl = helper13.resolve_download_url("SUB.srt", 123, "md5-sub", "", disk_name="盘G")
+check(dl == "http://edge.example/file", "自定义参数播放成功")
+sp2 = fake_g.share_create_calls[0]["payload"]
+exp2 = _dt.datetime.strptime(sp2["expiration"], "%Y-%m-%dT%H:%M:%S+08:00")
+check(
+    (exp2 - now_dt) > _dt.timedelta(hours=20)
+    and (exp2 - now_dt) < _dt.timedelta(days=2),
+    f"自定义有效期 1 天: {sp2['expiration']}",
+)
+check(
+    sp2["sharePwd"] == "pwd123" and sp2["fillPwdSwitch"] == 1,
+    "自定义提取码写入分享",
+)
+
+# 11.8 独立函数冒烟：OnDemandShareCache 上限与逐出
+odc = OnDemandShareCache(maxsize=2)
+odc.set(("a", "m1", 1), {"share_id": "s1", "expired_at": time.time() + 10})
+odc.set(("a", "m2", 2), {"share_id": "s2", "expired_at": time.time() + 20})
+odc.set(("a", "m3", 3), {"share_id": "s3", "expired_at": time.time() + 30})
+check(odc.size() == 2, "缓存超过上限自动逐出")
+check(odc.take(("a", "m1", 1)) is None, "最早过期条目被逐出")
+
 print(f"\n结果: {passed} 通过, {failed} 失败")
 sys.exit(1 if failed else 0)

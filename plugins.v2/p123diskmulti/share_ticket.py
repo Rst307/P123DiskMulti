@@ -24,12 +24,14 @@
 import base64
 import threading
 import time
+from datetime import datetime, timedelta
 from typing import Dict, Optional, Tuple
 from urllib.parse import parse_qs, urlsplit
 
 import requests
 
 from app.log import logger
+from p123client import check_response
 
 # 分享票换票网关（与网页前端同域，实测该域签发的票 ur=vpngvaegvngvnp 正常家族）
 SHARE_API_BASE = "https://api.123278.com/b"
@@ -368,3 +370,254 @@ def get_share_download_url(
         f"下次请求将重试"
     )
     return None
+
+
+# ==================== 按需分享（懒建分享）模式 ====================
+#
+# 玩法：播放时按 md5+size 在账号网盘内定位文件，自动创建一个只含该文件的
+# 分享（带有效期，到期由 123 自动回收），再用分享票播放。
+# - 不预建目录分享、不索引全目录：任何自己上传/转存的文件都能直接播放
+# - 同一文件在有效期内多次播放只建一次分享，分享到期后下次播放自动重建
+# - 分享带提取码可选（默认免密，播放链路不需要用户交互）
+# - 定位：POST {base}/api/file/upload_request（web 通道秒传查询），
+#   data.Reuse=true 时 data.Info.FileId 即文件在网盘中的 ID（社区驱动一致用法）
+
+ON_DEMAND_API_BASE = "https://api.123278.com/b"
+_MAX_ON_DEMAND_CACHE = 128
+
+
+def on_demand_expire_iso(days: int) -> str:
+    """按需分享有效期：now + N 天，123 要求 ISO8601 +08:00 格式"""
+    dt = datetime.now() + timedelta(days=max(1, int(days)))
+    return dt.strftime("%Y-%m-%dT%H:%M:%S+08:00")
+
+
+class OnDemandShareCache:
+    """按需分享元数据缓存：key=(disk_name, etag, size) -> 分享记录
+
+    记录含 share_id/share_key/share_pwd/file_id/s3_key_flag/expired_at；
+    分享到期后条目不再命中（take 会取回旧记录供调用方清理旧分享）。
+    """
+
+    def __init__(self, maxsize: int = _MAX_ON_DEMAND_CACHE):
+        self._lock = threading.Lock()
+        self._items: Dict[tuple, dict] = {}
+        self._maxsize = maxsize
+
+    def take(self, key: tuple) -> Optional[dict]:
+        """原子取走记录（无论是否过期），供调用方复用或清理"""
+        with self._lock:
+            return self._items.pop(key, None)
+
+    def set(self, key: tuple, rec: dict):
+        with self._lock:
+            if len(self._items) >= self._maxsize:
+                # 逐出过期最早的记录
+                oldest = None
+                for k, v in self._items.items():
+                    if (
+                        oldest is None
+                        or v.get("expired_at", 0) < oldest[1].get("expired_at", 0)
+                    ):
+                        oldest = (k, v)
+                if oldest:
+                    self._items.pop(oldest[0], None)
+                else:
+                    self._items.pop(next(iter(self._items)), None)
+            self._items[key] = rec
+
+    def size(self) -> int:
+        with self._lock:
+            return len(self._items)
+
+
+def _locate_file(client, name: str, md5: str, size, base_url: str = ON_DEMAND_API_BASE):
+    """秒传定位：按 md5+size 在账号网盘内定位文件，返回 (file_id, s3_key_flag)
+
+    走 web 通道 upload_request（与网页前端同域）；只信任 Reuse=true 的
+    响应（说明云端按 md5 命中已有文件），其余视为定位失败。
+    """
+    try:
+        resp = client.upload_request(
+            {
+                "etag": md5,
+                "fileName": name or "",
+                "size": int(size or 0),
+                "parentFileId": 0,
+                "type": 0,
+                "duplicate": 0,
+            },
+            base_url=base_url,
+            async_=False,
+        )
+        check_response(resp)
+    except Exception as e:
+        logger.error(f"【123多盘】按需分享定位文件请求失败: {e}")
+        return None
+    data = resp.get("data") or {}
+    if not data.get("Reuse"):
+        return None
+    info = data.get("Info") or {}
+    file_id = info.get("FileId") or info.get("FileID") or data.get("FileId")
+    s3_flag = info.get("S3KeyFlag") or ""
+    if not file_id:
+        return None
+    return int(file_id), s3_flag
+
+
+def _create_share(
+    client,
+    file_id,
+    name: str,
+    ttl_days: int,
+    share_pwd: str,
+    base_url: str = ON_DEMAND_API_BASE,
+):
+    """按需建分享：只含单个文件，带有效期；返回 {share_id, share_key, share_pwd}"""
+    try:
+        resp = client.share_create(
+            {
+                "fileIdList": str(int(file_id)),
+                "shareName": (name or "")[:30] or "按需分享",
+                "sharePwd": share_pwd or "",
+                "fillPwdSwitch": 1 if share_pwd else 0,
+                "expiration": on_demand_expire_iso(ttl_days),
+                "displayStatus": 2,
+                "driveId": 0,
+                "event": "shareCreate",
+                "isPayShare": False,
+                "isReward": 0,
+                "payAmount": 0,
+                "renameVisible": False,
+                "resourceDesc": "",
+                "trafficLimit": 0,
+                "trafficLimitSwitch": 1,
+                "trafficSwitch": 1,
+            },
+            base_url=base_url,
+            async_=False,
+        )
+        check_response(resp)
+    except Exception as e:
+        logger.error(f"【123多盘】按需分享建分享请求失败: {e}")
+        return None
+    data = resp.get("data") or {}
+    share_id = data.get("ShareId") or data.get("shareId")
+    share_key = data.get("ShareKey") or data.get("shareKey")
+    if not share_key:
+        logger.error(f"【123多盘】按需分享建分享响应缺少 ShareKey: {resp}")
+        return None
+    pwd = data.get("SharePwd") or data.get("sharePwd") or share_pwd or ""
+    return {"share_id": str(share_id or ""), "share_key": share_key, "share_pwd": pwd}
+
+
+def _cancel_share(client, share_id, base_url: str = ON_DEMAND_API_BASE):
+    """best-effort 取消分享（旧分享到期/失效时清理）"""
+    if not share_id:
+        return
+    try:
+        client.share_cancel(str(share_id), base_url=base_url, async_=False)
+        logger.debug(f"【123多盘】已清理按需分享 {share_id}")
+    except Exception as e:
+        logger.debug(f"【123多盘】按需分享清理旧分享失败（忽略）: {e}")
+
+
+def get_on_demand_share_url(
+    account,
+    disk_name: str,
+    name: str,
+    md5: str,
+    size,
+    ttl_days: int = 7,
+    share_pwd: str = "",
+    user_agent: str = "",
+    ticket_cache: Optional[ShareTicketCache] = None,
+    share_cache: Optional[OnDemandShareCache] = None,
+    timeout: float = 8,
+) -> Optional[str]:
+    """按需分享票完整链路（懒建分享）
+
+    1. 缓存命中且分享未过期 -> 复用该分享换票播放（同一文件有效期内只建一次分享）
+    2. 分享已过期 -> 先取消旧分享（到期自清理），再建新分享
+    3. 换票/解析失败（分享被风控或失效）-> 取消旧分享重建，重试一次
+    4. 定位/建分享/换票失败均返回 None，日志明确原因
+    :return: 可直接 302 给 Emby 的最终边缘 URL；失败 None
+    """
+    if not md5 or not size:
+        logger.error("【123多盘】按需分享需要文件的 md5 与 size（STRM URL 参数缺失）")
+        return None
+    token = getattr(account.client, "token", "") or ""
+    if not token:
+        logger.error("【123多盘】按需分享换票缺少登录态（账号未登录）")
+        return None
+    key = (disk_name, md5, int(size or 0))
+    rec = share_cache.take(key) if share_cache else None
+    if rec:
+        if rec.get("expired_at", 0) <= time.time():
+            _cancel_share(account.client, rec.get("share_id"))  # 到期自动清理
+            rec = None
+        else:
+            url = get_share_download_url(
+                token,
+                rec["share_key"],
+                rec.get("share_pwd") or share_pwd,
+                rec["file_id"],
+                rec.get("s3_key_flag", ""),
+                md5,
+                size,
+                user_agent=user_agent,
+                cache=ticket_cache,
+                timeout=timeout,
+            )
+            if url:
+                if share_cache:
+                    share_cache.set(key, rec)
+                return url
+            # 换票/解析失败：分享可能被风控或失效 -> 重建
+            logger.warn(
+                f"【123多盘】按需分享 {name} 换票失败，取消旧分享后重建"
+            )
+            _cancel_share(account.client, rec.get("share_id"))
+            rec = None
+    # 建新分享
+    located = _locate_file(account.client, name, md5, size)
+    if not located:
+        logger.error(
+            f"【123多盘】按需分享定位文件失败（{name}，md5={md5}，size={size}）："
+            "网盘中未找到该文件，请确认 STRM 与网盘数据一致"
+        )
+        return None
+    file_id, s3_flag = located
+    share = _create_share(account.client, file_id, name, ttl_days, share_pwd)
+    if not share:
+        logger.error(
+            f"【123多盘】按需分享建分享失败（{name}），请稍后重试或切换 VIP 直链模式"
+        )
+        return None
+    logger.info(
+        f"【123多盘】已为 {name} 创建按需分享（有效期 {ttl_days} 天，"
+        f"{on_demand_expire_iso(ttl_days)} 过期，提取码{'有' if share['share_pwd'] else '无'}）"
+    )
+    rec = {
+        "share_id": share["share_id"],
+        "share_key": share["share_key"],
+        "share_pwd": share["share_pwd"],
+        "file_id": file_id,
+        "s3_key_flag": s3_flag,
+        "expired_at": time.time() + max(1, int(ttl_days)) * 86400,
+    }
+    url = get_share_download_url(
+        token,
+        rec["share_key"],
+        rec["share_pwd"],
+        file_id,
+        s3_flag,
+        md5,
+        size,
+        user_agent=user_agent,
+        cache=ticket_cache,
+        timeout=timeout,
+    )
+    if url and share_cache:
+        share_cache.set(key, rec)
+    return url
