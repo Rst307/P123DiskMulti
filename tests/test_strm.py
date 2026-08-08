@@ -872,5 +872,33 @@ odc.set(("a", "m3", 3), {"share_id": "s3", "expired_at": time.time() + 30})
 check(odc.size() == 2, "缓存超过上限自动逐出")
 check(odc.take(("a", "m1", 1)) is None, "最早过期条目被逐出")
 
+# 11.12 搜索定位请求头不注入 Authorization（回归：大写键会覆盖 p123client
+#       客户端小写 authorization 键，token 过期自动重登后重试仍带旧 token，
+#       导致 401「token contains an invalid number of segments」直接暴露）
+from P123DiskMulti.share_ticket import _web_headers  # noqa: E402
+wh = _web_headers("ua-test")
+check(
+    "Authorization" not in wh and "authorization" not in wh,
+    f"_web_headers 不注入 Authorization（保持客户端自带登录态）: {sorted(wh)}",
+)
+check(wh.get("platform") == "web" and wh.get("App-Version") == "132", "web 平台头保留")
+
+# 11.13 搜索请求被 401 拒绝（登录态失效）时：不再误报「未命中」，
+#       直接遍历兜底仍能定位原文件并播放成功
+fake_g.fail_search_401 = True
+fake_g.fs_list_new_calls.clear()
+fake_g.share_create_calls.clear()
+tl._share_download_calls.clear()
+helper12._on_demand_share_cache.take(("盘G", "md5-ond", 999))
+dl = helper12.resolve_download_url("MOV.A.mkv", 999, "md5-ond", "", disk_name="盘G")
+fake_g.fail_search_401 = False
+check(dl == "http://edge.example/file", "搜索 401 被拒时遍历兜底仍播放成功")
+search_headers = (fake_g.fs_list_new_calls or [{}])[0].get("headers") or {}
+check(
+    "Authorization" not in search_headers,
+    f"搜索请求头不含插件注入的 Authorization（避免覆盖客户端登录态）: {sorted(search_headers)}",
+)
+check(len(fake_g.upload_request_calls) == 0, "401 被拒兜底同样不调用秒传")
+
 print(f"\n结果: {passed} 通过, {failed} 失败")
 sys.exit(1 if failed else 0)

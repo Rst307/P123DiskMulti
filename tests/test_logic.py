@@ -204,6 +204,7 @@ class FakeP123Client:
         self.upload_request_calls = []
         self.fs_list_new_calls = []
         self.search_off = False  # True 时全局搜索返回空（模拟搜索未命中）
+        self.fail_search_401 = False  # True 时全局搜索抛 401 认证异常（模拟登录态失效）
 
     def _new_id(self):
         self.next_id += 1
@@ -242,7 +243,15 @@ class FakeP123Client:
 
     def fs_list_new(self, payload, base_url="", event="homeListFile", **kwargs):
         """模拟 web 文件列表（file/list/new）：SearchData 时全局按名模糊搜索"""
-        self.fs_list_new_calls.append({"payload": dict(payload), "base_url": base_url})
+        self.fs_list_new_calls.append({
+            "payload": dict(payload),
+            "base_url": base_url,
+            "headers": kwargs.get("headers"),
+        })
+        if getattr(self, "fail_search_401", False):
+            raise P123AuthenticationError(
+                1, {"code": 401, "message": "token contains an invalid number of segments", "data": None}
+            )
         search = payload.get("SearchData") or ""
         if search:
             if getattr(self, "search_off", False):

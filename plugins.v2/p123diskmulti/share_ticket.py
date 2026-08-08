@@ -61,13 +61,19 @@ _DEFAULT_TTL = 600
 _MAX_CACHE = 256
 
 
-def _web_headers(user_agent: str, token: str) -> dict:
-    """分享票请求头（网页前端模板 + 登录态）。"""
+def _web_headers(user_agent: str) -> dict:
+    """分享票请求头（网页前端模板）。
+
+    注意：**不要**在这里注入 Authorization 头。p123client 的客户端对象自身
+    已携带当前 token（小写 authorization 键，换票重登后自动更新）；若这里再
+    注入一个大写 Authorization 键，会在 httpx 大小写不敏感合并时覆盖客户端
+    的键，导致 token 过期后 p123client 自动重登并重试时仍携带旧 token，
+    401 直接暴露给插件（按需分享搜索定位被拒）。
+    """
     return {
         "User-Agent": user_agent or DEFAULT_UA,
         "platform": WEB_PLATFORM,
         "App-Version": WEB_APP_VERSION,
-        "Authorization": f"Bearer {token}" if token else "",
     }
 
 
@@ -474,18 +480,20 @@ def _search_file(
     md5: str,
     size,
     user_agent: str = "",
-    token: str = "",
     base_url: str = ON_DEMAND_API_BASE,
 ):
     """全局搜索定位：GET file/list/new（SearchData 按文件名搜索，跨整个网盘）
 
     文件名仅作搜索关键字，结果按 etag+size 精确命中才采用（避免同名不同内容
-    的文件被误定位）；命中返回原文件 (file_id, s3_key_flag)。纯查询，
+    的文件被误定位）；命中返回 (原文件 file_id, s3_key_flag)。纯查询，
     不会在网盘创建任何副本。
+    返回 (located, rejected)：命中时 located 为 (file_id, s3_key_flag) 元组，
+    否则为 None；rejected 表示请求被接口拒绝（401 登录态失效），调用方据此
+    区分「未命中」与「被拒绝」。
     """
     keyword = str(name or "").strip()
     if not keyword:
-        return None
+        return None, False
     if len(keyword) > 128:
         # 超长文件名截断为无扩展名主干（搜索关键字过长可能被服务端拒绝）
         stem = keyword.rsplit(".", 1)[0] if "." in keyword else keyword
@@ -501,17 +509,22 @@ def _search_file(
                     "fileCategory": 0,
                 },
                 base_url=base_url,
-                headers=_web_headers(user_agent, token),
+                headers=_web_headers(user_agent),
             )
             check_response(resp)
         except P123AuthenticationError as e:
+            # 附 token 形态便于诊断：123 网关对非 JWT 格式的 Bearer 值返回
+            # 「token contains an invalid number of segments」（正常 JWT 为
+            # 三段式），长度+段数一眼可辨是过期重登问题还是 token 已损坏。
+            live_token = getattr(client, "token", "") or ""
             logger.warn(
                 f"【123多盘】按需分享搜索定位请求被拒绝（账号登录态失效或接口 401）：{e}"
+                f"（当前 token 长度 {len(live_token)}，段数 {live_token.count('.')}）"
             )
-            return None
+            return None, True
         except Exception as e:
             logger.warn(f"【123多盘】按需分享搜索定位请求失败: {e}")
-            return None
+            return None, False
         data = resp.get("data") or {}
         items = data.get("InfoList") or data.get("infoList") or []
         for it in items:
@@ -524,10 +537,10 @@ def _search_file(
             file_id = it.get("FileId") or it.get("fileId") or it.get("FileID")
             if not file_id:
                 continue
-            return int(file_id), str(it.get("S3KeyFlag") or "")
+            return (int(file_id), str(it.get("S3KeyFlag") or "")), False
         if not items or str(data.get("Next") or "") == "-1":
             break
-    return None
+    return None, False
 
 
 def _walk_find_file(client, md5: str, size):
@@ -560,8 +573,10 @@ def _walk_find_file(client, md5: str, size):
                 )
                 check_response(resp)
             except P123AuthenticationError as e:
+                live_token = getattr(client, "token", "") or ""
                 logger.warn(
                     f"【123多盘】按需分享遍历定位请求被拒绝（账号登录态失效或接口 401）：{e}"
+                    f"（当前 token 长度 {len(live_token)}，段数 {live_token.count('.')}）"
                 )
                 return None
             except Exception as e:
@@ -607,7 +622,6 @@ def _locate_file(
     name: str = "",
     md5: str = "",
     size=0,
-    token: str = "",
     user_agent: str = "",
     base_url: str = ON_DEMAND_API_BASE,
 ):
@@ -616,12 +630,18 @@ def _locate_file(
     两者均为纯查询（不调用秒传、不创建任何副本），返回原文件
     (file_id, s3_key_flag)；找不到返回 None。
     """
-    located = _search_file(client, name, md5, size, user_agent, token, base_url)
+    located, rejected = _search_file(client, name, md5, size, user_agent, base_url)
     if located:
         return located
-    logger.warn(
-        f"【123多盘】按需分享全局搜索未命中（{name or md5}），改为遍历网盘定位（仅按需，可能较慢）"
-    )
+    if rejected:
+        logger.warn(
+            f"【123多盘】按需分享全局搜索被拒绝（401 登录态失效），直接遍历网盘定位"
+            "（仅按需，可能较慢）"
+        )
+    else:
+        logger.warn(
+            f"【123多盘】按需分享全局搜索未命中（{name or md5}），改为遍历网盘定位（仅按需，可能较慢）"
+        )
     return _walk_find_file(client, md5, size)
 
 
@@ -746,7 +766,6 @@ def get_on_demand_share_url(
         name=name,
         md5=md5,
         size=size,
-        token=token,
         user_agent=user_agent,
     )
     if not located:
