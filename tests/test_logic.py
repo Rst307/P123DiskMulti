@@ -407,13 +407,13 @@ class FakeAutoClient:
         )
 
     def get_download_url(self, payload, headers=None, base_urls=None,
-                         probe=True, timeout=8):
+                         probe=True, timeout=8, cache_ttl=600):
         if base_urls is not None:
             self.set_download_base_urls(base_urls)
         return _tool.exchange_and_validate(
             self._fake, payload, headers=headers, state=self._dl_state,
             probe=_tool.probe_download_url if probe else False,
-            timeout=timeout,
+            timeout=timeout, cache_ttl=cache_ttl,
         )
 
 

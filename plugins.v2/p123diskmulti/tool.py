@@ -41,6 +41,12 @@ _WORKING_TTL = 30 * 60
 _FAIL_COOLDOWN = 5 * 60
 # 票有效性探测超时（秒）
 _DEFAULT_PROBE_TIMEOUT = 8
+# 已验证下载直链缓存（秒）：降低签票频率。Emby 每次播放会 HEAD+GET 两次签票，
+# 重缓冲/反复点播更频繁；风控大概率由签票频率/模式触发，缓存命中即不再签票，
+# 能把签票频率降一个量级（123 直链有效期远大于缓存 TTL：否则长片播放中早已断流）
+DEFAULT_URL_CACHE_TTL = 600
+# 缓存条目上限（防内存无界增长）
+_URL_CACHE_MAX = 256
 
 
 def _label(base: str) -> str:
@@ -63,6 +69,8 @@ class DownloadTicketState:
         self.working: Optional[str] = None  # 最近验证通过的域名
         self.working_until: float = 0.0  # working 状态到期时间
         self.failed: Dict[str, float] = {}  # 域名 -> 最近失败时间
+        # 已验证下载直链缓存：文件标识 -> (url, 过期时间戳)
+        self._url_cache: Dict[tuple, Tuple[str, float]] = {}
         self._lock = threading.Lock()
 
     def candidates(self) -> List[str]:
@@ -96,6 +104,46 @@ class DownloadTicketState:
         """标记某域名换票失败（进入冷却）"""
         with self._lock:
             self.failed[base] = time.time()
+
+    def cache_get(self, key: tuple) -> Optional[str]:
+        """取未过期的已验证直链缓存"""
+        if not key:
+            return None
+        now = time.time()
+        with self._lock:
+            item = self._url_cache.get(key)
+            if item and item[1] > now:
+                return item[0]
+            if item:
+                self._url_cache.pop(key, None)
+        return None
+
+    def cache_set(self, key: tuple, url: str, ttl: float):
+        """写入已验证直链缓存（ttl<=0 不缓存）"""
+        if not key or ttl <= 0:
+            return
+        with self._lock:
+            if len(self._url_cache) >= _URL_CACHE_MAX:
+                # 清理过期条目，仍满则丢弃最旧的一条
+                now = time.time()
+                stale = [k for k, (_, exp) in self._url_cache.items() if exp <= now]
+                for k in stale:
+                    self._url_cache.pop(k, None)
+                if len(self._url_cache) >= _URL_CACHE_MAX:
+                    oldest = min(
+                        self._url_cache.items(), key=lambda kv: kv[1][1]
+                    )
+                    self._url_cache.pop(oldest[0], None)
+            self._url_cache[key] = (url, time.time() + ttl)
+
+
+def _cache_key(payload: dict) -> tuple:
+    """按文件全局标识构造缓存键（S3KeyFlag 是 123 全局文件标识）"""
+    return tuple(
+        payload.get(k)
+        for k in ("S3KeyFlag", "Etag", "FileID", "Size")
+        if payload.get(k) is not None
+    ) or ()
 
 
 def probe_download_url(
@@ -157,6 +205,7 @@ def exchange_and_validate(
     state: Optional[DownloadTicketState] = None,
     probe: Optional[Union[Callable, bool]] = None,
     timeout: float = _DEFAULT_PROBE_TIMEOUT,
+    cache_ttl: float = DEFAULT_URL_CACHE_TTL,
 ) -> Optional[str]:
     """
     换取 123 下载直链并验证票有效性；通道被风控时自动切换域名重试
@@ -168,9 +217,19 @@ def exchange_and_validate(
     :param probe: 探测函数 (url, headers, timeout) -> (ok, status, detail)；
                   None 用默认探测；False 表示关闭探测（取第一个换链成功结果）
     :param timeout: 探测超时（秒）
+    :param cache_ttl: 已验证直链缓存秒数；<=0 关闭缓存。缓存命中即不再签票，
+                      能显著降低签票频率（风控触发的主要信号）
     :return: 验证通过的 DownloadUrl；全部通道失败返回 None
     """
     state = state or DownloadTicketState(None)
+    key = _cache_key(payload)
+    if cache_ttl > 0 and key:
+        cached = state.cache_get(key)
+        if cached:
+            logger.debug(
+                f"【123多盘】命中已验证下载链接缓存（避免重复签票）: {cached[:200]}"
+            )
+            return cached
     candidates = state.candidates()
     if probe is False:
         # 探测关闭：按候选顺序取第一个换链成功的结果（不做有效性验证，兼容旧行为）
@@ -183,6 +242,7 @@ def exchange_and_validate(
                 url = (resp.get("data") or {}).get("DownloadUrl")
                 if url:
                     state.mark_working(base)
+                    state.cache_set(key, url, cache_ttl)
                     return url
             except Exception as e:
                 state.mark_failed(base)
@@ -208,6 +268,7 @@ def exchange_and_validate(
         ok, status, detail = probe_fn(url, headers=headers, timeout=timeout)
         if ok:
             state.mark_working(base)
+            state.cache_set(key, url, cache_ttl)
             if base != candidates[0]:
                 logger.warn(
                     f"【123多盘】下载通道被风控，切换换链域名 {label} 后恢复"
@@ -230,7 +291,8 @@ def exchange_and_validate(
             last_err = f"下载票被网关拒绝（{label}）: HTTP 403 {detail}"
         else:
             # 非 403 失败（404/5xx）或网络异常（status=0）：不做域名切换。
-            # 探测方与下载方网络路径可能不同，按原链接返回由下载方自行尝试。
+            # 探测方与下载方网络路径可能不同，按原链接返回由下载方自行尝试
+            # （未经验证，不入缓存）。
             logger.warn(
                 f"【123多盘】下载票探测异常（{label}）: HTTP {status or '网络错误'} "
                 f"{detail}，按原链接返回，以实际下载结果为准"
@@ -301,15 +363,18 @@ class P123AutoClient:
         base_urls: Optional[Iterable[str]] = None,
         probe: bool = True,
         timeout: float = _DEFAULT_PROBE_TIMEOUT,
+        cache_ttl: float = DEFAULT_URL_CACHE_TTL,
     ) -> Optional[str]:
         """
-        换取并验证 123 下载直链：通道被风控（CDN 403 50002/1010）时自动切换域名重试
+        换取并验证 123 下载直链：通道被风控（CDN 403 50002/1010）时自动切换域名重试；
+        已验证直链按文件缓存（cache_ttl 秒），命中不再签票，降低风控触发频率
 
         :param payload: download_info 载荷
         :param headers: 换链请求头（User-Agent 等）
         :param base_urls: 换链域名候选覆盖（None 沿用当前状态/内置默认）
         :param probe: 是否探测票有效性并自动切换域名（默认开启）
         :param timeout: 探测超时（秒）
+        :param cache_ttl: 已验证直链缓存秒数（默认 600，0 关闭）
         :return: 验证通过的 DownloadUrl，失败返回 None
         """
         if base_urls is not None:
@@ -321,4 +386,5 @@ class P123AutoClient:
             state=self._dl_state,
             probe=probe_download_url if probe else False,
             timeout=timeout,
+            cache_ttl=cache_ttl,
         )

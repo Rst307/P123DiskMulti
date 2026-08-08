@@ -44,7 +44,7 @@ class P123DiskMulti(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/DDSRem-Dev/MoviePilot-Plugins/main/icons/P123Disk.png"
     # 插件版本
-    plugin_version = "1.4.2"
+    plugin_version = "1.4.3"
     # 插件作者
     plugin_author = "Rst307"
     # 作者主页
@@ -73,6 +73,8 @@ class P123DiskMulti(_PluginBase):
         self._download_base_urls: Optional[List[str]] = None
         # 下载票探测 + 通道风控自动切换域名
         self._download_probe = True
+        # 已验证下载直链缓存秒数（降低签票频率，防止风控触发）
+        self._download_cache_ttl = 600
         # 分享增量同步任务
         self._shares: List[ShareSync] = []
         # 定期目录整理（调用 MoviePilot 整理链）
@@ -115,6 +117,10 @@ class P123DiskMulti(_PluginBase):
                 if l.strip()
             ] or None
             self._download_probe = config.get("download_probe", True)
+            try:
+                self._download_cache_ttl = int(config.get("download_cache_ttl") or 0)
+            except (TypeError, ValueError):
+                self._download_cache_ttl = 600
 
             # 分享增量同步配置
             self._share_enabled = config.get("share_enabled", False)
@@ -178,6 +184,7 @@ class P123DiskMulti(_PluginBase):
             media_exts=DEFAULT_MEDIA_EXTS,
             download_base_urls=self._download_base_urls,
             download_probe=self._download_probe,
+            download_cache_ttl=self._download_cache_ttl,
         )
         if self._full_sync_paths and self._full_sync_cron:
             try:
@@ -947,6 +954,22 @@ class P123DiskMulti(_PluginBase):
                             },
                             {
                                 "component": "VCol",
+                                "props": {"cols": 12, "md": 4},
+                                "content": [
+                                    {
+                                        "component": "VTextField",
+                                        "props": {
+                                            "model": "download_cache_ttl",
+                                            "label": "下载链接缓存（秒）",
+                                            "type": "number",
+                                            "hint": "已验证下载直链缓存时长：Emby 每次播放会 HEAD+GET 签两次票，缓存命中即不再签票，显著降低风控触发频率；0 关闭缓存",
+                                            "persistent-hint": True,
+                                        },
+                                    }
+                                ],
+                            },
+                            {
+                                "component": "VCol",
                                 "props": {"cols": 12},
                                 "content": [
                                     {
@@ -1308,6 +1331,7 @@ class P123DiskMulti(_PluginBase):
             # 下载换链域名（高级）：留空用内置默认
             "download_base_urls": "",
             "download_probe": True,
+            "download_cache_ttl": 600,
             # 分享增量同步默认配置
             "share_enabled": False,
             "shares_text": "",
@@ -1564,6 +1588,11 @@ class P123DiskMulti(_PluginBase):
                             else "默认双通道（api.123278.com/b + yun 通道）"
                         )
                         + f"，风控自动切换{'开启' if self._download_probe else '关闭'}"
+                        + (
+                            f"，直链缓存 {self._download_cache_ttl}s"
+                            if self._download_cache_ttl > 0
+                            else "，直链缓存关闭"
+                        )
                     ),
                 }
             )

@@ -60,6 +60,7 @@ class StrmHelper:
         media_exts: Optional[List[str]] = None,
         download_base_urls: Optional[List[str]] = None,
         download_probe: bool = True,
+        download_cache_ttl: int = 600,
     ):
         self._api = api
         self._moviepilot_address = str(moviepilot_address or "").rstrip("/")
@@ -75,6 +76,11 @@ class StrmHelper:
         )
         # 是否探测下载票有效性并在通道被风控时自动切换域名
         self._download_probe = bool(download_probe)
+        # 已验证下载直链缓存秒数（<=0 关闭）：命中不再签票，降低风控触发频率
+        try:
+            self._download_cache_ttl = int(download_cache_ttl or 0)
+        except (TypeError, ValueError):
+            self._download_cache_ttl = 600
         # 全量同步防重入锁
         self._sync_lock = threading.Lock()
         # 后台同步状态（start_full_sync 更新，sync_status 读取）
@@ -174,6 +180,7 @@ class StrmHelper:
                 headers={"User-Agent": user_agent or DEFAULT_UA},
                 base_urls=self._download_base_urls,
                 probe=self._download_probe,
+                cache_ttl=self._download_cache_ttl,
             )
             if not url:
                 logger.error(

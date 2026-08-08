@@ -300,5 +300,54 @@ check(fake_c.last_download_bases == ["https://custom.example.com/b"],
 
 tool_mod.probe_download_url = _orig_probe
 
+# ============ 8. 下载链接缓存（降低签票频率，防风控触发） ============
+print("== 8. 下载链接缓存 ==")
+api3 = P123MultiApi(disks=[], disk_name="123云盘")
+acc_d = tl.make_account("盘D", 10 * 1024 ** 3, 1 * 1024 ** 3)
+api3._accounts = [acc_d]
+fake_d = acc_d.client._fake
+helper5 = StrmHelper(api=api3, moviepilot_address="http://127.0.0.1:3000")
+
+tool_mod.probe_download_url = _fake_probe
+
+# 8.1 首次请求：签票一次
+fake_d.last_download_bases = []
+probe_queue = [(True, 206, "")]
+dl = helper5.resolve_download_url("i.mkv", 100, "m9", "s9", disk_name="盘D")
+check(dl == "http://download/1", "首次换链成功")
+check(fake_d.last_download_bases == ["https://api.123278.com/b"],
+      f"首次签票一次: {fake_d.last_download_bases}")
+
+# 8.2 同一文件 TTL 内再次请求（Emby HEAD+GET）：命中缓存，不再签票
+fake_d.last_download_bases = []
+probe_queue = [(True, 206, "")]  # 若发生探测会被消费，命中缓存则原样保留
+fake_d.last_download_bases = []
+dl = helper5.resolve_download_url("i.mkv", 100, "m9", "s9", disk_name="盘D")
+check(dl == "http://download/1", "缓存命中返回相同链接")
+check(fake_d.last_download_bases == [],
+      f"缓存命中未再签票: {fake_d.last_download_bases}")
+check(len(probe_queue) == 1, "缓存命中未再探测")
+
+# 8.3 不同文件不受缓存影响
+fake_d.last_download_bases = []
+probe_queue = [(True, 206, "")]
+dl = helper5.resolve_download_url("j.mkv", 100, "m10", "s10", disk_name="盘D")
+check(dl == "http://download/1", "其他文件正常签票")
+check(len(fake_d.last_download_bases) == 1, "不同文件重新签票")
+
+# 8.4 关闭缓存（download_cache_ttl=0）：每次请求都签票
+helper6 = StrmHelper(
+    api=api3, moviepilot_address="http://127.0.0.1:3000", download_cache_ttl=0
+)
+fake_d.last_download_bases = []
+probe_queue = [(True, 206, ""), (True, 206, "")]
+d1 = helper6.resolve_download_url("k.mkv", 100, "m11", "s11", disk_name="盘D")
+d2 = helper6.resolve_download_url("k.mkv", 100, "m11", "s11", disk_name="盘D")
+check(d1 == "http://download/1" and d2 == "http://download/1", "关闭缓存仍可换链")
+check(len(fake_d.last_download_bases) == 2,
+      f"关闭缓存时每次请求都签票: {fake_d.last_download_bases}")
+
+tool_mod.probe_download_url = _orig_probe
+
 print(f"\n结果: {passed} 通过, {failed} 失败")
 sys.exit(1 if failed else 0)
