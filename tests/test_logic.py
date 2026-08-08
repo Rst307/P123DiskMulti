@@ -195,6 +195,8 @@ class FakeP123Client:
         self.fail_share_fs_list_once = False
         # 按需分享（OnDemand 测试用）
         self.upload_request_calls = []
+        self.fs_list_new_calls = []
+        self.search_off = False  # True 时全局搜索返回空（模拟搜索未命中）
 
     def _new_id(self):
         self.next_id += 1
@@ -227,6 +229,34 @@ class FakeP123Client:
     # ---- 文件操作 ----
     def fs_list(self, payload):
         parent = payload.get("parentFileId", 0)
+        children = self._children(parent)
+        children.sort(key=lambda e: e["FileName"])
+        return {"code": 0, "data": {"InfoList": children, "Next": "-1"}}
+
+    def fs_list_new(self, payload, base_url="", event="homeListFile", **kwargs):
+        """模拟 web 文件列表（file/list/new）：SearchData 时全局按名模糊搜索"""
+        self.fs_list_new_calls.append({"payload": dict(payload), "base_url": base_url})
+        search = payload.get("SearchData") or ""
+        if search:
+            if getattr(self, "search_off", False):
+                return {"code": 0, "data": {"InfoList": [], "Next": "-1"}}
+            kw = str(search).lower()
+            matches = [
+                e for e in self.entries.values()
+                if e["Type"] == 0 and kw in str(e["FileName"]).lower()
+            ]
+            page = max(1, int(payload.get("Page", 1)))
+            limit = max(1, int(payload.get("limit", 100)))
+            chunk = matches[(page - 1) * limit: page * limit]
+            return {
+                "code": 0,
+                "data": {
+                    "InfoList": [dict(e) for e in chunk],
+                    "Next": "-1",
+                    "Total": len(matches),
+                },
+            }
+        parent = int(payload.get("parentFileId", 0))
         children = self._children(parent)
         children.sort(key=lambda e: e["FileName"])
         return {"code": 0, "data": {"InfoList": children, "Next": "-1"}}

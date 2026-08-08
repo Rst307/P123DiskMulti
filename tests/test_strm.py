@@ -630,38 +630,55 @@ acc_g = make_account("盘G", 100 * 1024 ** 3, 10 * 1024 ** 3)
 api6._accounts = [acc_g]
 fake_g = acc_g.client._fake
 
-# 网盘内已存在的文件（直接上传/转存均可，无需任何分享记录）
-fake_g._entry("MOV.A.mkv", 0, "file", size=999, etag="md5-ond")
-fake_g._entry("SUB.srt", 0, "file", size=123, etag="md5-sub")
+# 网盘内已存在的文件（位于子目录：按需分享必须指向原文件，不在根目录产生副本）
+tv_dir = fake_g._entry("剧集", 0, "dir")
+s1_dir = fake_g._entry("第一季", tv_dir["FileId"], "dir")
+fake_g._entry("MOV.A.mkv", s1_dir["FileId"], "file", size=999, etag="md5-ond")
+fake_g._entry("SUB.srt", s1_dir["FileId"], "file", size=123, etag="md5-sub")
 
-# 11.1 首次播放：秒传定位 -> 建分享（带有效期）-> 换票 -> 边缘 URL
+# 11.1 首次播放：全局搜索定位原文件 -> 建分享（带有效期）-> 换票 -> 边缘 URL
 helper12 = StrmHelper(
     api=api6, moviepilot_address="http://127.0.0.1:3000",
     ticket_mode="on_demand",
 )
-fake_g.upload_request_calls.clear()
+fake_g.fs_list_new_calls.clear()
 fake_g.share_create_calls.clear()
 tl._share_download_calls.clear()
+entries_before = len(fake_g.entries)
 dl = helper12.resolve_download_url("MOV.A.mkv", 999, "md5-ond", "", disk_name="盘G")
 check(dl == "http://edge.example/file", f"按需分享首次播放成功: {dl}")
 check(
-    fake_g.upload_request_calls
-    and fake_g.upload_request_calls[0]["payload"]["etag"] == "md5-ond"
-    and fake_g.upload_request_calls[0]["payload"]["size"] == 999
-    and fake_g.upload_request_calls[0]["base_url"] == ON_DEMAND_API_BASE,
-    "秒传定位：md5+size 且走 api.123278.com/b 通道",
+    fake_g.fs_list_new_calls
+    and "MOV.A.mkv" in str(fake_g.fs_list_new_calls[0]["payload"].get("SearchData", ""))
+    and fake_g.fs_list_new_calls[0]["base_url"] == ON_DEMAND_API_BASE,
+    "定位：全局搜索（file/list/new + SearchData）走 api.123278.com/b 通道",
+)
+check(
+    len(fake_g.upload_request_calls) == 0,
+    "定位不调用秒传 upload_request（不产生副本）",
 )
 check(len(fake_g.share_create_calls) == 1, "自动建分享一次")
 loc_id = [
     e["FileId"] for e in fake_g.entries.values()
-    if e["FileName"] == "MOV.A.mkv"
+    if e["FileName"] == "MOV.A.mkv" and e["ParentFileId"] == s1_dir["FileId"]
 ][0]
 sp = fake_g.share_create_calls[0]["payload"]
 check(
     sp["fileIdList"] == str(loc_id) and sp["sharePwd"] == ""
     and sp["fillPwdSwitch"] == 0
     and fake_g.share_create_calls[0]["base_url"] == ON_DEMAND_API_BASE,
-    f"建分享参数：fileIdList={sp.get('fileIdList')} 免提取码 走 api.123278.com/b",
+    f"建分享参数：fileIdList=原文件（子目录内）{sp.get('fileIdList')} 免提取码 走 api.123278.com/b",
+)
+check(
+    len(fake_g.entries) == entries_before,
+    "播放后网盘条目数不变（未在根目录复制文件）",
+)
+check(
+    not any(
+        e["FileName"] == "MOV.A.mkv" and e["ParentFileId"] == 0
+        for e in fake_g.entries.values()
+    ),
+    "根目录未出现同名副本",
 )
 import datetime as _dt
 exp = _dt.datetime.strptime(sp["expiration"], "%Y-%m-%dT%H:%M:%S+08:00")
@@ -700,13 +717,42 @@ check(
 )
 check(len(fake_g.share_create_calls) == 1, "到期后重新建分享")
 
-# 11.4 文件不在网盘（定位失败）：返回 None，不建分享
+# 11.4 文件不在网盘（搜索+遍历均未命中）：返回 None，不建分享
 fake_g.share_create_calls.clear()
 dl = helper12.resolve_download_url("GHOST.mkv", 12345, "md5-ghost", "", disk_name="盘G")
 check(dl is None, "定位失败返回 None")
 check(len(fake_g.share_create_calls) == 0, "定位失败不建分享")
 
-# 11.5 建分享接口失败：返回 None（先清缓存确保走到建分享路径）
+# 11.5 全局搜索未命中时遍历兜底定位原文件（不调用秒传）
+fake_g.search_off = True
+fake_g.share_create_calls.clear()
+fake_g.fs_list_new_calls.clear()
+dl = helper12.resolve_download_url("SUB.srt", 123, "md5-sub", "", disk_name="盘G")
+fake_g.search_off = False
+check(dl == "http://edge.example/file", "搜索未命中时遍历兜底定位成功")
+sub_id = [
+    e["FileId"] for e in fake_g.entries.values()
+    if e["FileName"] == "SUB.srt" and e["ParentFileId"] == s1_dir["FileId"]
+][0]
+check(
+    fake_g.share_create_calls
+    and fake_g.share_create_calls[0]["payload"]["fileIdList"] == str(sub_id),
+    "遍历兜底后仍分享原文件（子目录内）",
+)
+check(len(fake_g.upload_request_calls) == 0, "遍历兜底同样不调用秒传")
+
+# 11.6 回归：根目录已存在同名同内容文件（旧版本秒传留下的副本）也能播放，
+#     不再报 5060，且不新增任何条目（清缓存强制走定位+重建路径）
+fake_g._entry("MOV.A.mkv", 0, "file", size=999, etag="md5-ond")  # 根目录同名副本
+fake_g.share_create_calls.clear()
+helper12._on_demand_share_cache.take(key_od)
+entries_before = len(fake_g.entries)
+dl = helper12.resolve_download_url("MOV.A.mkv", 999, "md5-ond", "", disk_name="盘G")
+check(dl == "http://edge.example/file", "根目录存在同名文件时播放成功（无 5060）")
+check(len(fake_g.entries) == entries_before, "播放后网盘条目数不变（不重复复制）")
+check(len(fake_g.upload_request_calls) == 0, "同名场景同样不调用秒传")
+
+# 11.7 建分享接口失败：返回 None（先清缓存确保走到建分享路径）
 helper12._on_demand_share_cache.take(key_od)
 fake_g.fail_share_create = True
 fake_g.share_create_calls.clear()
@@ -714,7 +760,7 @@ dl = helper12.resolve_download_url("MOV.A.mkv", 999, "md5-ond", "", disk_name="�
 check(dl is None, "建分享失败返回 None")
 fake_g.fail_share_create = False
 
-# 11.6 分享票通道 403 风控：缓存复用失败 -> 取消旧分享重建一次，恢复后自愈
+# 11.8 分享票通道 403 风控：缓存复用失败 -> 取消旧分享重建一次，恢复后自愈
 fake_g.share_create_calls.clear()
 fake_g.share_cancel_calls.clear()
 helper12._on_demand_share_cache.take(key_od)  # 用 11.3 留下的分享缓存
@@ -730,7 +776,7 @@ tl.fake_get._share_210_403 = False
 dl = helper12.resolve_download_url("MOV.A.mkv", 999, "md5-ond", "", disk_name="盘G")
 check(dl == "http://edge.example/file", "风控恢复后播放自愈")
 
-# 11.7 自定义有效期（1 天）+ 提取码
+# 11.9 自定义有效期（1 天）+ 提取码
 helper13 = StrmHelper(
     api=api6, moviepilot_address="http://127.0.0.1:3000",
     ticket_mode="on_demand",
@@ -752,7 +798,7 @@ check(
     "自定义提取码写入分享",
 )
 
-# 11.8 独立函数冒烟：OnDemandShareCache 上限与逐出
+# 11.10 独立函数冒烟：OnDemandShareCache 上限与逐出
 odc = OnDemandShareCache(maxsize=2)
 odc.set(("a", "m1", 1), {"share_id": "s1", "expired_at": time.time() + 10})
 odc.set(("a", "m2", 2), {"share_id": "s2", "expired_at": time.time() + 20})

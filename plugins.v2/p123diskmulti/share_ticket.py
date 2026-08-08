@@ -374,16 +374,24 @@ def get_share_download_url(
 
 # ==================== 按需分享（懒建分享）模式 ====================
 #
-# 玩法：播放时按 md5+size 在账号网盘内定位文件，自动创建一个只含该文件的
-# 分享（带有效期，到期由 123 自动回收），再用分享票播放。
+# 玩法：播放时按 md5+size 在账号网盘内定位【原文件】，自动创建一个只含该
+# 文件的分享（带有效期，到期由 123 自动回收），再用分享票播放。
 # - 不预建目录分享、不索引全目录：任何自己上传/转存的文件都能直接播放
 # - 同一文件在有效期内多次播放只建一次分享，分享到期后下次播放自动重建
 # - 分享带提取码可选（默认免密，播放链路不需要用户交互）
-# - 定位：POST {base}/api/file/upload_request（web 通道秒传查询），
-#   data.Reuse=true 时 data.Info.FileId 即文件在网盘中的 ID（社区驱动一致用法）
+# - 定位：GET {base}/api/file/list/new（SearchData 全局按名搜索）优先，未命中
+#   再递归 fs_list 遍历兜底；只按 etag+size 精确命中原文件并返回其
+#   FileId/S3KeyFlag，纯查询、不创建任何副本。不采用 upload_request 秒传定位
+#   （v1.4.7）：秒传会在根目录生成重复文件（虚拟转存），且同名文件已存在时
+#   服务端返回 5060 直接中断播放
 
 ON_DEMAND_API_BASE = "https://api.123278.com/b"
 _MAX_ON_DEMAND_CACHE = 128
+# 全局搜索最多翻页数（每页 100 条）：单文件命中通常在第 1 页
+_MAX_SEARCH_PAGES = 5
+# 遍历兜底上限（防超大网盘拖垮首次播放）：超过即放弃并提示用户
+_MAX_WALK_DIRS = 500
+_MAX_WALK_ITEMS = 20000
 
 
 def on_demand_expire_iso(days: int) -> str:
@@ -431,38 +439,151 @@ class OnDemandShareCache:
             return len(self._items)
 
 
-def _locate_file(client, name: str, md5: str, size, base_url: str = ON_DEMAND_API_BASE):
-    """秒传定位：按 md5+size 在账号网盘内定位文件，返回 (file_id, s3_key_flag)
+def _search_file(
+    client,
+    name: str,
+    md5: str,
+    size,
+    user_agent: str = "",
+    token: str = "",
+    base_url: str = ON_DEMAND_API_BASE,
+):
+    """全局搜索定位：GET file/list/new（SearchData 按文件名搜索，跨整个网盘）
 
-    走 web 通道 upload_request（与网页前端同域）；只信任 Reuse=true 的
-    响应（说明云端按 md5 命中已有文件），其余视为定位失败。
+    文件名仅作搜索关键字，结果按 etag+size 精确命中才采用（避免同名不同内容
+    的文件被误定位）；命中返回原文件 (file_id, s3_key_flag)。纯查询，
+    不会在网盘创建任何副本。
     """
-    try:
-        resp = client.upload_request(
-            {
-                "etag": md5,
-                "fileName": name or "",
-                "size": int(size or 0),
-                "parentFileId": 0,
-                "type": 0,
-                "duplicate": 0,
-            },
-            base_url=base_url,
-            async_=False,
-        )
-        check_response(resp)
-    except Exception as e:
-        logger.error(f"【123多盘】按需分享定位文件请求失败: {e}")
+    keyword = str(name or "").strip()
+    if not keyword:
         return None
-    data = resp.get("data") or {}
-    if not data.get("Reuse"):
-        return None
-    info = data.get("Info") or {}
-    file_id = info.get("FileId") or info.get("FileID") or data.get("FileId")
-    s3_flag = info.get("S3KeyFlag") or ""
-    if not file_id:
-        return None
-    return int(file_id), s3_flag
+    if len(keyword) > 128:
+        # 超长文件名截断为无扩展名主干（搜索关键字过长可能被服务端拒绝）
+        stem = keyword.rsplit(".", 1)[0] if "." in keyword else keyword
+        keyword = stem[:128]
+    for page in range(1, _MAX_SEARCH_PAGES + 1):
+        try:
+            resp = client.fs_list_new(
+                {
+                    "SearchData": keyword,
+                    "Page": page,
+                    "limit": 100,
+                    "operateType": 2,
+                    "fileCategory": 0,
+                },
+                base_url=base_url,
+                headers=_web_headers(user_agent, token),
+            )
+            check_response(resp)
+        except Exception as e:
+            logger.warn(f"【123多盘】按需分享搜索定位请求失败: {e}")
+            return None
+        data = resp.get("data") or {}
+        items = data.get("InfoList") or data.get("infoList") or []
+        for it in items:
+            if str(it.get("Type", 0)) in ("1", "True"):
+                continue  # 目录
+            if int(it.get("Size") or 0) != int(size or 0):
+                continue
+            if str(it.get("Etag") or "") != str(md5 or ""):
+                continue
+            file_id = it.get("FileId") or it.get("fileId") or it.get("FileID")
+            if not file_id:
+                continue
+            return int(file_id), str(it.get("S3KeyFlag") or "")
+        if not items or str(data.get("Next") or "") == "-1":
+            break
+    return None
+
+
+def _walk_find_file(client, md5: str, size):
+    """遍历兜底定位：BFS 递归 fs_list，按 etag+size 精确匹配原文件
+
+    仅当全局搜索未命中时使用（如文件已被改名，搜索不到）；纯查询，
+    不创建任何副本。带目录/条目上限防止超大网盘拖垮首次播放。
+    """
+    size = int(size or 0)
+    visited = set()
+    queue = [0]
+    dirs_seen = 0
+    items_seen = 0
+    while queue:
+        parent = queue.pop(0)
+        if str(parent) in visited:
+            continue
+        visited.add(str(parent))
+        page = 1
+        while True:
+            try:
+                resp = client.fs_list(
+                    {
+                        "limit": 100,
+                        "next": 0,
+                        "Page": page,
+                        "parentFileId": int(parent),
+                        "inDirectSpace": "false",
+                    }
+                )
+                check_response(resp)
+            except Exception as e:
+                logger.warn(f"【123多盘】按需分享遍历定位请求失败: {e}")
+                return None
+            data = resp.get("data") or {}
+            items = data.get("InfoList") or data.get("infoList") or []
+            if not items:
+                break
+            for it in items:
+                items_seen += 1
+                if items_seen > _MAX_WALK_ITEMS:
+                    logger.warn(
+                        f"【123多盘】按需分享遍历定位超过 {_MAX_WALK_ITEMS} 项仍未命中，放弃"
+                    )
+                    return None
+                if str(it.get("Type", 0)) in ("1", "True"):
+                    queue.append(it.get("FileId") or it.get("fileId") or 0)
+                    continue
+                if int(it.get("Size") or 0) != size:
+                    continue
+                if str(it.get("Etag") or "") != str(md5 or ""):
+                    continue
+                file_id = it.get("FileId") or it.get("fileId") or it.get("FileID")
+                if not file_id:
+                    continue
+                return int(file_id), str(it.get("S3KeyFlag") or "")
+            if len(items) < 100 or str(data.get("Next") or "") == "-1":
+                break
+            page += 1
+        dirs_seen += 1
+        if dirs_seen > _MAX_WALK_DIRS:
+            logger.warn(
+                f"【123多盘】按需分享遍历定位超过 {_MAX_WALK_DIRS} 个目录仍未命中，放弃"
+            )
+            return None
+    return None
+
+
+def _locate_file(
+    client,
+    disk_name: str = "",
+    name: str = "",
+    md5: str = "",
+    size=0,
+    token: str = "",
+    user_agent: str = "",
+    base_url: str = ON_DEMAND_API_BASE,
+):
+    """定位网盘内原文件：优先全局搜索，未命中再递归遍历兜底
+
+    两者均为纯查询（不调用秒传、不创建任何副本），返回原文件
+    (file_id, s3_key_flag)；找不到返回 None。
+    """
+    located = _search_file(client, name, md5, size, user_agent, token, base_url)
+    if located:
+        return located
+    logger.warn(
+        f"【123多盘】按需分享全局搜索未命中（{name or md5}），改为遍历网盘定位（仅按需，可能较慢）"
+    )
+    return _walk_find_file(client, md5, size)
 
 
 def _create_share(
@@ -579,12 +700,21 @@ def get_on_demand_share_url(
             )
             _cancel_share(account.client, rec.get("share_id"))
             rec = None
-    # 建新分享
-    located = _locate_file(account.client, name, md5, size)
+    # 建新分享（定位原文件：全局搜索优先、遍历兜底，纯查询不创建副本）
+    located = _locate_file(
+        account.client,
+        disk_name=disk_name,
+        name=name,
+        md5=md5,
+        size=size,
+        token=token,
+        user_agent=user_agent,
+    )
     if not located:
         logger.error(
             f"【123多盘】按需分享定位文件失败（{name}，md5={md5}，size={size}）："
-            "网盘中未找到该文件，请确认 STRM 与网盘数据一致"
+            "已尝试全局搜索与遍历，网盘中未找到原文件，请确认 STRM 与网盘数据一致"
+            "（文件名/大小/md5），或切换回 VIP 直链模式"
         )
         return None
     file_id, s3_flag = located
