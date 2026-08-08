@@ -19,6 +19,7 @@ import threading
 import weakref
 from datetime import datetime
 from pathlib import Path, PurePosixPath
+from types import SimpleNamespace
 from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 from urllib.parse import quote
 
@@ -65,6 +66,7 @@ class StrmHelper:
         download_cache_ttl: int = 600,
         ticket_mode: str = "vip",
         shares: Optional[list] = None,
+        self_share=None,
     ):
         self._api = api
         self._moviepilot_address = str(moviepilot_address or "").rstrip("/")
@@ -91,6 +93,8 @@ class StrmHelper:
             self._ticket_mode = "vip"
         # 分享任务列表（分享票模式：md5 -> 分享记录 -> shareKey/FileId 反查用）
         self._shares = list(shares or [])
+        # 自分享目录管理器（自己分享自己的文件，分享票播放）
+        self._self_share = self_share
         # 分享票缓存（只缓存换票结果，每次播放仍做一次 210 解析）
         self._share_ticket_cache = ShareTicketCache()
         # 全量同步防重入锁
@@ -343,6 +347,23 @@ class StrmHelper:
                     result.append((task, rec))
             except Exception as e:
                 logger.warn(f"【123多盘STRM】查询分享记录失败（{task.name}）: {e}")
+        # 自分享目录记录（自己分享自己的文件，分享票播放）
+        if self._self_share is not None:
+            try:
+                for rec in self._self_share.find_by_etag(md5, size):
+                    result.append(
+                        (
+                            SimpleNamespace(
+                                share_key=rec.get("share_key") or "",
+                                share_pwd=rec.get("share_pwd") or "",
+                                name=rec.get("dir_path") or "自分享",
+                                find_share_file=lambda *a: None,
+                            ),
+                            rec,
+                        )
+                    )
+            except Exception as e:
+                logger.warn(f"【123多盘STRM】查询自分享记录失败: {e}")
         result.sort(
             key=lambda t: (
                 1 if t[1].get("file_id") and t[1].get("share_s3_key_flag") else 0,

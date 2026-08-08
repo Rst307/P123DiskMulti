@@ -504,5 +504,118 @@ check(
     "t 余量不足 5 分钟不缓存",
 )
 
+# ============ 10. 自分享目录服务（独立服务：自己分享文件走分享票） ============
+print("== 10. 自分享目录服务 ==")
+from P123DiskMulti.self_share import (  # noqa: E402
+    SELF_SHARE_API_BASE,
+    SelfShareManager,
+)
+
+self_share_tmp = tempfile.mkdtemp(prefix="p123selfshare_")
+api5 = P123MultiApi(disks=[], disk_name="123云盘")
+acc_f = make_account("盘F", 100 * 1024 ** 3, 10 * 1024 ** 3)
+api5._accounts = [acc_f]
+fake_f = acc_f.client._fake
+
+# 网盘内目录树：/盘F/电影/S01.mkv（自分享目录 = /盘F/电影）
+fake_f._entry("电影", 0, "dir")
+film_dir = [
+    e for e in fake_f.entries.values()
+    if e["FileName"] == "电影" and e["ParentFileId"] == 0
+][0]
+fake_f._entry("S01.mkv", film_dir["FileId"], "file", size=502475797, etag="md5-self1")
+# 分享内文件树（建分享后遍历用）：根目录直接列出分享内容
+fake_f.share_entries = {
+    0: [
+        {
+            "FileId": 901, "FileName": "S01.mkv", "Type": 0,
+            "Size": 502475797, "Etag": "md5-self1",
+            "S3KeyFlag": "111-0", "ParentFileId": 0,
+        }
+    ]
+}
+
+ssm = SelfShareManager(
+    api=api5,
+    db_path=_Path(self_share_tmp) / "selfshare.sqlite3",
+)
+ssm.set_dirs([("/盘F/电影", "")])
+
+# 10.1 首次同步：建分享 + 索引
+r = ssm.sync_dir("/盘F/电影", "")
+check(r.get("ok") and r.get("files") == 1, f"首次同步建分享+索引: {r}")
+check(len(fake_f.share_create_calls) == 1, "调用 share_create 一次")
+check(
+    fake_f.share_create_calls[0]["payload"]["fileIdList"] == str(film_dir["FileId"]),
+    "分享的是网盘目录 FileId",
+)
+check(
+    fake_f.share_create_calls[0]["base_url"] == SELF_SHARE_API_BASE,
+    "建分享走 api.123278.com/b 通道",
+)
+
+# 10.2 再次同步：复用已有分享（不重复建）
+fake_f.share_create_calls.clear()
+r = ssm.sync_dir("/盘F/电影", "")
+check(r.get("ok"), "重复同步成功")
+check(len(fake_f.share_create_calls) == 0, "已有分享直接复用")
+
+# 10.3 播放：分享票模式走自分享记录（独立于分享增量同步）
+helper10 = StrmHelper(
+    api=api5, moviepilot_address="http://127.0.0.1:3000",
+    ticket_mode="share", shares=[], self_share=ssm,
+)
+tl._share_download_calls.clear()
+dl = helper10.resolve_download_url(
+    "S01.mkv", 502475797, "md5-self1", "", disk_name="盘F"
+)
+check(dl == "http://edge.example/file", "自分享记录分享票播放成功")
+check(
+    len(tl._share_download_calls) == 1
+    and tl._share_download_calls[0]["json"]["shareKey"] == fake_f.shares[-1]["ShareKey"],
+    f"换票使用自建分享的 shareKey: {tl._share_download_calls[0]['json']['shareKey'] if tl._share_download_calls else None}",
+)
+
+# 10.4 分享失效自动重建（遍历失败 + 分享列表无此分享）
+fake_f.shares.clear()  # 分享被取消
+fake_f.share_create_calls.clear()
+fake_f.fail_share_fs_list_once = True
+r = ssm.sync_dir("/盘F/电影", "")
+check(r.get("ok"), "分享失效后自动重建成功")
+check(len(fake_f.share_create_calls) == 1, "失效后重新建分享")
+new_key = fake_f.shares[-1]["ShareKey"]
+recs = ssm.find_by_etag("md5-self1", 502475797)
+check(
+    recs and recs[0]["share_key"] == new_key,
+    f"索引已更新为新分享: {recs[0]['share_key'] if recs else None}",
+)
+
+# 10.5 手动重建：取消旧分享 + 重新建分享 + 重新索引
+fake_f.share_cancel_calls.clear()
+fake_f.share_create_calls.clear()
+targets = ssm.rebuild("/盘F/电影")
+check(targets == ["/盘F/电影"], f"rebuild 返回目标目录: {targets}")
+ssm.sync_dir("/盘F/电影", "")
+check(len(fake_f.share_cancel_calls) == 1, "重建时取消旧分享")
+check(len(fake_f.share_create_calls) == 1, "重建后重新建分享")
+
+# 10.6 分享内文件移除后自动清理
+fake_f.share_entries = {0: []}
+ssm.sync_dir("/盘F/电影", "")
+check(
+    ssm.find_by_etag("md5-self1", 502475797) == [],
+    "分享内已移除的文件索引被清理",
+)
+
+# 10.7 独立服务：未配置分享增量同步时播放回退 VIP（auto 模式）
+helper11 = StrmHelper(
+    api=api5, moviepilot_address="http://127.0.0.1:3000",
+    ticket_mode="auto", shares=[], self_share=ssm,
+)
+dl = helper11.resolve_download_url(
+    "别的.mkv", 100, "md5-none", "s3x", disk_name="盘F"
+)
+check(dl == "http://download/1", "无自分享记录时 auto 回退 VIP 直链")
+
 print(f"\n结果: {passed} 通过, {failed} 失败")
 sys.exit(1 if failed else 0)

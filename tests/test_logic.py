@@ -187,6 +187,12 @@ class FakeP123Client:
             "FileId": 0, "FileName": "", "ParentFileId": -1, "Type": 1,
             "Size": 0, "UpdateAt": "2024-01-01T00:00:00",
         }
+        # 自分享（SelfShare 测试用）
+        self.shares = []          # 已创建的分享列表
+        self.share_create_calls = []
+        self.share_cancel_calls = []
+        self.fail_share_create = False
+        self.fail_share_fs_list_once = False
 
     def _new_id(self):
         self.next_id += 1
@@ -308,6 +314,10 @@ class FakeP123Client:
 
     def share_fs_list(self, payload, base_url="", **kwargs):
         """模拟分享目录列表：从 share_entries 按 parentFileId 取，支持分页"""
+        if getattr(self, "fail_share_fs_list_once", False):
+            # 模拟分享已失效（首次调用失败一次，用于重建测试）
+            self.fail_share_fs_list_once = False
+            raise RuntimeError("share not found or expired")
         entries = getattr(self, "share_entries", None) or {}
         if not isinstance(entries, dict):
             return {"code": 0, "data": {"InfoList": [], "Next": "-1"}}
@@ -328,6 +338,57 @@ class FakeP123Client:
         for item in payload.get("file_list", []) or []:
             self._entry(item["file_name"], int(parent_id or 0), "file",
                         size=item.get("size") or 0, etag=item.get("etag") or "")
+        return {"code": 0}
+
+    # ---------- 自分享 API（SelfShare 测试用） ----------
+
+    def share_create(self, payload, base_url="", **kwargs):
+        """模拟建分享（web 通道）：记录调用并生成分享"""
+        self.share_create_calls.append({"payload": dict(payload), "base_url": base_url})
+        if getattr(self, "fail_share_create", False):
+            return {"code": 1, "message": "share create failed"}
+        eid = self._new_id()
+        share = {
+            "ShareId": eid,
+            "ShareKey": f"key-{eid}",
+            "ShareName": payload.get("shareName", ""),
+            "SharePwd": payload.get("sharePwd", ""),
+            "Status": 1,
+            "Expiration": payload.get("expiration", ""),
+        }
+        self.shares.append(share)
+        return {
+            "code": 0,
+            "data": {
+                "ShareId": eid,
+                "ShareKey": share["ShareKey"],
+                "SharePwd": share["SharePwd"],
+            },
+        }
+
+    def share_list(self, payload, base_url="", **kwargs):
+        """模拟分享列表（share/list）：分页返回，最新优先"""
+        page = max(1, int(payload.get("Page", 1)))
+        limit = max(1, int(payload.get("limit", 100)))
+        items = [dict(s) for s in getattr(self, "shares", [])]
+        items.sort(key=lambda s: s["ShareId"], reverse=True)
+        chunk = items[(page - 1) * limit: page * limit]
+        return {"code": 0, "data": {"InfoList": chunk, "Next": "-1"}}
+
+    def share_cancel(self, payload, base_url="", **kwargs):
+        """模拟取消分享（share/delete）"""
+        self.share_cancel_calls.append({"payload": payload, "base_url": base_url})
+        ids = []
+        if isinstance(payload, dict):
+            ids = [
+                str(x.get("shareId", ""))
+                for x in payload.get("shareInfoList", [])
+            ]
+        else:
+            ids = [str(payload)]
+        self.shares = [
+            s for s in self.shares if str(s["ShareId"]) not in ids
+        ]
         return {"code": 0}
 
     def upload_complete(self, data):

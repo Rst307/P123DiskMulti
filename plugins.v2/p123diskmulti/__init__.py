@@ -20,6 +20,7 @@ from app.utils.string import StringUtils
 
 from .organize import DEFAULT_ORGANIZE_CRON, OrganizeRunner
 from .p123_api import DiskAccount, P123MultiApi
+from .self_share import SelfShareManager
 from .share import ShareSync
 from .strm import DEFAULT_MEDIA_EXTS, StrmHelper
 
@@ -44,7 +45,7 @@ class P123DiskMulti(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/DDSRem-Dev/MoviePilot-Plugins/main/icons/P123Disk.png"
     # 插件版本
-    plugin_version = "1.4.5"
+    plugin_version = "1.4.6"
     # 插件作者
     plugin_author = "Rst307"
     # 作者主页
@@ -79,6 +80,11 @@ class P123DiskMulti(_PluginBase):
         self._ticket_mode = "vip"
         # 分享增量同步任务
         self._shares: List[ShareSync] = []
+        # 自分享目录（把自己网盘的目录建成分享，STRM 播放走分享票）
+        self._self_share: Optional[SelfShareManager] = None
+        self._self_share_enabled = False
+        self._self_share_dirs = ""
+        self._self_share_cron = "0 */6 * * *"
         # 定期目录整理（调用 MoviePilot 整理链）
         self._organize: Optional[OrganizeRunner] = None
 
@@ -133,6 +139,10 @@ class P123DiskMulti(_PluginBase):
             self._share_enabled = config.get("share_enabled", False)
             self._shares_text = config.get("shares_text") or ""
             self._share_cron = config.get("share_cron") or DEFAULT_SHARE_CRON
+            # 自分享目录配置
+            self._self_share_enabled = bool(config.get("self_share_enabled", False))
+            self._self_share_dirs = config.get("self_share_dirs") or ""
+            self._self_share_cron = config.get("self_share_cron") or "0 */6 * * *"
 
             # 定期目录整理配置
             self._organize_enabled = config.get("organize_enabled", False)
@@ -169,6 +179,8 @@ class P123DiskMulti(_PluginBase):
                     )
                     # 初始化分享增量同步（分享票模式依赖分享任务，必须先于 STRM 初始化）
                     self._init_shares()
+                    # 初始化自分享目录（把自己网盘的目录建成分享，分享票播放）
+                    self._init_self_share()
                     # 初始化 STRM 助手（多盘）
                     self._init_strm()
                     # 初始化定期目录整理
@@ -194,6 +206,7 @@ class P123DiskMulti(_PluginBase):
             download_cache_ttl=self._download_cache_ttl,
             ticket_mode=self._ticket_mode,
             shares=self._shares,
+            self_share=self._self_share,
         )
         if self._full_sync_paths and self._full_sync_cron:
             try:
@@ -345,6 +358,112 @@ class P123DiskMulti(_PluginBase):
         for task in self._shares:
             if not task.start_sync():
                 logger.info(f"【123多盘】分享 {task.name} 已有转存任务在运行，跳过本次")
+
+    # ==================== 自分享目录 ====================
+
+    def _init_self_share(self):
+        """
+        初始化自分享目录：把自己网盘的目录建成 123 分享，STRM 播放走分享票
+
+        - 首次启用：后台为尚未建分享的目录补建分享 + 索引（不阻塞启动）
+        - 定时刷新：分享有效期/目录内容变化自动重新索引
+        """
+        self._self_share = None
+        if not self._self_share_enabled:
+            return
+        items = self._parse_self_share_dirs(self._self_share_dirs)
+        if not items:
+            logger.info("【123多盘】自分享目录未配置")
+            return
+        try:
+            manager = SelfShareManager(
+                api=self._api,
+                db_path=self.get_data_path() / "p123selfshare.sqlite3",
+                media_exts=DEFAULT_MEDIA_EXTS,
+            )
+            manager.set_dirs(items)
+            self._self_share = manager
+        except Exception as e:
+            logger.error(f"【123多盘】自分享目录初始化失败: {e}")
+            return
+        # 首次：后台为尚未建分享的目录补建（幂等）
+        missing = [d for d, _ in items if not manager.has_dir(d)]
+        if missing:
+            threading.Thread(
+                target=self._run_self_share_sync,
+                args=(missing,),
+                daemon=True,
+            ).start()
+            logger.info(f"【123多盘】自分享目录后台初始化: {missing}")
+        # 定时刷新
+        if self._self_share_cron:
+            try:
+                trigger = CronTrigger.from_crontab(self._self_share_cron)
+                if not self._scheduler:
+                    self._scheduler = BackgroundScheduler(timezone=settings.TZ)
+                    self._scheduler.start()
+                self._scheduler.add_job(
+                    func=self._scheduled_self_share_sync,
+                    trigger=trigger,
+                    id="p123diskmulti_self_share_sync",
+                    name="123多盘自分享目录同步",
+                    max_instances=1,
+                    coalesce=True,
+                )
+                logger.info(
+                    f"【123多盘】自分享目录定时同步已启动: {self._self_share_cron}"
+                )
+            except Exception as e:
+                logger.error(f"【123多盘】自分享定时任务启动失败: {e}")
+
+    def _scheduled_self_share_sync(self):
+        """定时刷新自分享目录（后台执行）"""
+        if not self._self_share:
+            return
+        summary = self._self_share.sync_all()
+        results = summary.get("results") or []
+        ok = sum(1 for r in results if r.get("ok"))
+        logger.info(
+            f"【123多盘】自分享定时同步完成: {ok}/{len(results)} 成功"
+        )
+
+    def _run_self_share_sync(self, dirs: List[str]):
+        """后台线程：同步指定自分享目录（dirs 为空则全部）"""
+        try:
+            if not self._self_share:
+                return
+            if dirs:
+                pwd_map = dict(self._self_share.dirs())
+                for d in dirs:
+                    try:
+                        self._self_share.sync_dir(d, pwd_map.get(d, ""))
+                    except Exception as e:
+                        logger.error(f"【123多盘】自分享目录 {d} 同步失败: {e}")
+            else:
+                self._self_share.sync_all()
+        except Exception as e:
+            logger.error(f"【123多盘】自分享后台同步异常: {e}")
+
+    @staticmethod
+    def _parse_self_share_dirs(text: str) -> List[Tuple[str, str]]:
+        """
+        解析自分享目录配置：每行 目录虚拟路径[,提取码]
+
+        '/盘A/电影'  -> [('/盘A/电影', '')]
+        '/盘A/电影,1234' -> [('/盘A/电影', '1234')]
+        """
+        result = []
+        for line in (text or "").splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if "," in line:
+                vpath, pwd = line.rsplit(",", 1)
+                result.append((vpath.strip(), pwd.strip()))
+            else:
+                result.append((line, ""))
+        return result
+
 
     @staticmethod
     def _parse_shares(shares_text: str) -> List[Dict[str, Any]]:
@@ -615,6 +734,22 @@ class P123DiskMulti(_PluginBase):
                 "methods": ["POST"],
                 "summary": "定期目录整理（后台）",
                 "description": "扫描指定 123 盘目录的媒体文件并提交到 MoviePilot 整理队列，立即返回",
+            },
+            {
+                "path": "/self_share/sync",
+                "endpoint": self.api_self_share_sync,
+                "auth": "bear",
+                "methods": ["GET"],
+                "summary": "重建自分享目录（后台）",
+                "description": "取消旧分享并重新建分享+索引（参数 dir=目录虚拟路径，留空则全部目录）",
+            },
+            {
+                "path": "/self_share/status",
+                "endpoint": self.api_self_share_status,
+                "auth": "bear",
+                "methods": ["GET"],
+                "summary": "查询自分享目录状态",
+                "description": "返回每个自分享目录的分享链接、索引文件数与上次同步结果",
             },
             {
                 "path": "/organize_status",
@@ -1000,7 +1135,7 @@ class P123DiskMulti(_PluginBase):
                                                     "value": "auto",
                                                 },
                                             ],
-                                            "hint": "VIP 直链：账号直链换链，带域名风控自动切换；分享票：通过分享下载票播放（多 IP 播放为分享设计内行为，不受账号 VIP 通道风控影响，仅分享转存入库的文件可用，需启用分享增量同步）；自动：分享票优先、失败自动回退 VIP",
+                                            "hint": "VIP 直链：账号直链换链，带域名风控自动切换；分享票：通过分享下载票播放（多 IP 播放为分享设计内行为，不受账号 VIP 通道风控影响；来源必须是「自分享目录服务」的目录或「分享增量同步」转存入库的文件）；自动：分享票优先、失败自动回退 VIP",
                                             "persistent-hint": True,
                                         },
                                     }
@@ -1173,6 +1308,116 @@ class P123DiskMulti(_PluginBase):
                                                 "component": "div",
                                                 "props": {"class": "text-caption"},
                                                 "text": "• 插件详情页可「检查内容」「⚡ 立刻检测转存」，转存在后台执行，页面不阻塞；立刻检测转存一键完成分享检测 + 增量转存",
+                                            },
+                                        ],
+                                    }
+                                ],
+                            },
+                            # 自分享目录服务（分享票播放，独立服务）
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12},
+                                "content": [
+                                    {
+                                        "component": "VDivider",
+                                        "props": {"class": "my-2"},
+                                    }
+                                ],
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12},
+                                "content": [
+                                    {
+                                        "component": "div",
+                                        "props": {
+                                            "class": "text-subtitle-1 font-weight-bold mb-1"
+                                        },
+                                        "text": "🔗 自分享目录服务（分享票播放，独立服务）",
+                                    }
+                                ],
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 4},
+                                "content": [
+                                    {
+                                        "component": "VSwitch",
+                                        "props": {
+                                            "model": "self_share_enabled",
+                                            "label": "启用自分享目录服务",
+                                            "color": "primary",
+                                            "hint": "独立于分享增量同步：自动把自己网盘的目录建成 123 分享，STRM 播放走分享票（多 IP 下载是分享设计内行为，不受 VIP 直链通道风控影响）",
+                                            "persistent-hint": True,
+                                        },
+                                    }
+                                ],
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 8},
+                                "content": [
+                                    {
+                                        "component": "VTextField",
+                                        "props": {
+                                            "model": "self_share_cron",
+                                            "label": "定时刷新分享（cron）",
+                                            "hint": "定期校验分享有效性并重新索引目录内容；留空则不自动刷新（可在插件页手动重建）",
+                                            "persistent-hint": True,
+                                        },
+                                    }
+                                ],
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12},
+                                "content": [
+                                    {
+                                        "component": "VTextarea",
+                                        "props": {
+                                            "model": "self_share_dirs",
+                                            "rows": 4,
+                                            "label": "自分享目录列表（每行一个）",
+                                            "placeholder": "目录虚拟路径[,提取码(可选)]\n例如：\n/盘A/电影\n/盘B/剧集,1234",
+                                            "hint": "目录必须是本插件账号网盘内的媒体目录（与 STRM 同步的同一批目录）；启用后自动建分享并索引媒体文件；提取码留空则无提取码",
+                                            "persistent-hint": True,
+                                        },
+                                    }
+                                ],
+                            },
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12},
+                                "content": [
+                                    {
+                                        "component": "VAlert",
+                                        "props": {
+                                            "type": "info",
+                                            "variant": "tonal",
+                                            "density": "compact",
+                                        },
+                                        "content": [
+                                            {
+                                                "component": "div",
+                                                "props": {
+                                                    "class": "text-subtitle-2 font-weight-bold mb-1"
+                                                },
+                                                "text": "💡 自分享目录说明",
+                                            },
+                                            {
+                                                "component": "div",
+                                                "props": {"class": "text-caption"},
+                                                "text": "• 独立服务：不依赖分享增量同步；启用后自动为每个目录创建永久分享（api.123278.com 通道）并索引媒体文件",
+                                            },
+                                            {
+                                                "component": "div",
+                                                "props": {"class": "text-caption"},
+                                                "text": "• 播放票类型选择「分享票」或「自动」后，自己上传/转存的媒体文件都可走分享票播放，多 IP 拉流不再触发账号风控",
+                                            },
+                                            {
+                                                "component": "div",
+                                                "props": {"class": "text-caption"},
+                                                "text": "• 分享链接/提取码在插件详情页展示，可复制分享给朋友；分享被风控时在详情页点「重建分享」即可恢复",
                                             },
                                         ],
                                     }
@@ -1375,6 +1620,9 @@ class P123DiskMulti(_PluginBase):
             "share_enabled": False,
             "shares_text": "",
             "share_cron": "0 */6 * * *",
+            "self_share_enabled": False,
+            "self_share_dirs": "",
+            "self_share_cron": "0 */6 * * *",
             # 定期目录整理默认配置
             "organize_enabled": False,
             "organize_paths": "",
@@ -1843,6 +2091,87 @@ class P123DiskMulti(_PluginBase):
                                                 "component": "div",
                                                 "props": {"class": "mt-2"},
                                                 "content": share_lines,
+                                            },
+                                        ],
+                                    }
+                                ],
+                            }
+                        ],
+                    }
+                )
+
+        # 自分享目录服务卡片（独立服务：自己分享自己的目录，分享票播放）
+        if self._self_share:
+            self_rows = self._self_share.status()
+            for row in self_rows:
+                self_lines = [
+                    {
+                        "component": "div",
+                        "props": {"class": "text-caption"},
+                        "text": f"• 分享链接：{row['share_url'] or '未创建'}"
+                        + (f"（提取码 {row['share_pwd']}）" if row.get("share_pwd") else "（无提取码）"),
+                    },
+                    {
+                        "component": "div",
+                        "props": {"class": "text-caption"},
+                        "text": f"• 已索引 {row.get('file_count', 0)} 个媒体文件"
+                        + (f" · 更新于 {row.get('updated_at', '')}" if row.get("updated_at") else ""),
+                    },
+                ]
+                if row.get("status") and row["status"] != "ok":
+                    self_lines.append(
+                        {
+                            "component": "div",
+                            "props": {"class": "text-caption font-weight-bold"},
+                            "text": f"• 状态：{row['status']}（{row.get('message') or ''}）",
+                        }
+                    )
+                content[0]["content"].append(
+                    {
+                        "component": "VCol",
+                        "props": {"cols": 12, "md": 6},
+                        "content": [
+                            {
+                                "component": "VCard",
+                                "props": {"variant": "tonal"},
+                                "content": [
+                                    {
+                                        "component": "VCardText",
+                                        "content": [
+                                            {
+                                                "component": "div",
+                                                "content": [
+                                                    {
+                                                        "component": "span",
+                                                        "props": {
+                                                            "class": "text-subtitle-1 font-weight-bold"
+                                                        },
+                                                        "text": f"🔗 自分享：{row['dir_path']}",
+                                                    },
+                                                    {
+                                                        "component": "VBtn",
+                                                        "props": {
+                                                            "color": "error",
+                                                            "variant": "tonal",
+                                                            "size": "small",
+                                                            "class": "ml-2",
+                                                            "prepend-icon": "mdi-link-variant-off",
+                                                        },
+                                                        "text": "重建分享",
+                                                        "events": {
+                                                            "click": {
+                                                                "api": "plugin/P123DiskMulti/self_share/sync",
+                                                                "method": "get",
+                                                                "params": {"dir": row["dir_path"]},
+                                                            },
+                                                        },
+                                                    },
+                                                ],
+                                            },
+                                            {
+                                                "component": "div",
+                                                "props": {"class": "mt-2"},
+                                                "content": self_lines,
                                             },
                                         ],
                                     }
@@ -2421,6 +2750,58 @@ class P123DiskMulti(_PluginBase):
         return {
             "success": True,
             "shares": [task.status() for task in self._shares],
+        }
+
+    def api_self_share_sync(self, request: Request = None) -> Dict[str, Any]:
+        """
+        重建自分享目录（后台执行）：取消旧分享 -> 重新建分享 -> 重新索引
+
+        GET /self_share/sync?dir=目录虚拟路径；dir 为空则全部目录
+        """
+        if not self._self_share:
+            return {"success": False, "message": "自分享目录服务未启用或未配置"}
+        dir_arg = (request.query_params.get("dir") if request else "") or ""
+        if dir_arg and dir_arg not in [d for d, _ in self._self_share.dirs()]:
+            return {"success": False, "message": f"目录 {dir_arg} 未配置"}
+        try:
+            targets = self._self_share.rebuild(dir_arg or None)
+        except Exception as e:
+            return {"success": False, "message": f"重建失败: {e}"}
+        if not targets:
+            return {"success": False, "message": "没有需要重建的目录（请检查目录路径配置）"}
+        threading.Thread(
+            target=self._run_self_share_sync,
+            args=(targets,),
+            daemon=True,
+        ).start()
+        return {
+            "success": True,
+            "background": True,
+            "message": f"已开始重建 {len(targets)} 个自分享目录（后台执行），请稍后刷新页面查看",
+        }
+
+    def api_self_share_status(self, request: Request = None) -> Dict[str, Any]:
+        """
+        查询自分享目录服务状态
+        """
+        if not self._self_share:
+            return {"success": False, "message": "自分享目录服务未启用或未配置"}
+        rows = self._self_share.status()
+        return {
+            "success": True,
+            "self_shares": [
+                {
+                    "dir": r["dir_path"],
+                    "account": r["account"],
+                    "share_url": r["share_url"],
+                    "share_pwd": r["share_pwd"],
+                    "file_count": r["file_count"],
+                    "status": r["status"],
+                    "message": r["message"],
+                    "updated_at": r["updated_at"],
+                }
+                for r in rows
+            ],
         }
 
     def _refresh_emby(self, paths: List[str]):
