@@ -19,7 +19,7 @@ import time
 from typing import Callable, Dict, Iterable, List, Optional, Tuple, Union
 
 import requests
-from p123client import check_response
+from p123client import P123Client, check_response
 
 from app.log import logger
 

@@ -392,6 +392,10 @@ def fake_get(url, stream=True, **kwargs):
 # 下载换链域名逻辑与生产一致：复用 tool.py 的 exchange_and_validate
 import P123DiskMulti.tool as _tool  # noqa: E402
 
+# 回归保护：tool 模块必须持有从 p123client 导入的 P123Client
+# （生产环境 P123AutoClient 懒加载客户端依赖它，丢失会 NameError 全盘失效）
+assert _tool.P123Client is object, "tool.P123Client 未从 p123client 导入"
+
 
 class FakeAutoClient:
     def __init__(self, fake):
