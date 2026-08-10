@@ -46,7 +46,7 @@ class P123DiskMulti(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/DDSRem-Dev/MoviePilot-Plugins/main/icons/P123Disk.png"
     # 插件版本
-    plugin_version = "1.4.13"
+    plugin_version = "1.4.14"
     # 插件作者
     plugin_author = "Rst307"
     # 作者主页
@@ -690,6 +690,14 @@ class P123DiskMulti(_PluginBase):
                 "methods": ["POST"],
                 "summary": "测试所有网盘连接",
                 "description": "测试所有网盘账号的连接状态",
+            },
+            {
+                "path": "/devices",
+                "endpoint": self.api_devices,
+                "auth": "bear",
+                "methods": ["GET"],
+                "summary": "查看登录设备列表",
+                "description": "查看所有网盘账号的 123 登录设备记录（排查 token 数量超限）",
             },
             {
                 "path": "/balance",
@@ -1755,6 +1763,22 @@ class P123DiskMulti(_PluginBase):
                             {
                                 "component": "VBtn",
                                 "props": {
+                                    "color": "primary",
+                                    "variant": "tonal",
+                                    "size": "small",
+                                    "prepend-icon": "mdi-cellphone-link",
+                                },
+                                "text": "查看设备",
+                                "events": {
+                                    "click": {
+                                        "api": "plugin/P123DiskMulti/devices",
+                                        "method": "get",
+                                    },
+                                },
+                            },
+                            {
+                                "component": "VBtn",
+                                "props": {
                                     "color": "warning",
                                     "variant": "tonal",
                                     "size": "small",
@@ -2610,6 +2634,36 @@ class P123DiskMulti(_PluginBase):
             }
         except Exception as e:
             return {"success": False, "message": f"测试失败: {e}"}
+
+    def api_devices(self) -> Dict[str, Any]:
+        """
+        查看所有网盘账号的登录设备列表（排查 token 超限）
+        """
+        if not self._api:
+            return {"success": False, "message": "插件未启用或未配置网盘"}
+        try:
+            results = self._api.device_list()
+            lines = []
+            all_ok = True
+            for r in results:
+                if not r.get("ok"):
+                    all_ok = False
+                    lines.append(f"✗ {r['name']}: {r.get('message', '获取失败')}")
+                    continue
+                devices = r.get("devices") or []
+                lines.append(f"{r['name']}（{r.get('count', 0)} 台设备）")
+                for d in devices:
+                    info = d.get("name") or "未知设备"
+                    if d.get("time"):
+                        info += f" · {d['time']}"
+                    if d.get("platform"):
+                        info += f" · {d['platform']}"
+                    lines.append(f"  - {info}")
+            message = "\n".join(lines)
+            logger.info(f"【123多盘】设备列表:\n{message}")
+            return {"success": all_ok, "message": message, "results": results}
+        except Exception as e:
+            return {"success": False, "message": f"获取设备列表失败: {e}"}
 
     def api_balance(self) -> Dict[str, Any]:
         """

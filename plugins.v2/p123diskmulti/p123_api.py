@@ -1882,6 +1882,94 @@ class P123MultiApi:
                 )
         return results
 
+    # ==================== 设备列表 ====================
+
+    def device_list(self) -> List[Dict]:
+        """
+        查看所有网盘账号的登录设备列表（123 设备管理）
+
+        用于排查 token 数量超限：123 按每次登录产生的 token 累计设备，
+        通过这里可直接看到账号下都有哪些设备、什么时候登录的。
+
+        :return: [{name, ok, count, devices: [{name, id, time, status, platform}], message}]
+        """
+        results = []
+        for acc in self._accounts:
+            try:
+                resp = acc.client.user_device_list({"event": "deviceManagement"})
+                data = resp.get("data") or {}
+                if isinstance(data, dict):
+                    items = (
+                        data.get("list")
+                        or data.get("List")
+                        or data.get("infoList")
+                        or data.get("InfoList")
+                        or data.get("rows")
+                        or []
+                    )
+                elif isinstance(data, list):
+                    items = data
+                else:
+                    items = []
+                devices = []
+                for it in items or []:
+                    if not isinstance(it, dict):
+                        devices.append({"name": str(it), "id": "", "time": "", "status": "", "platform": ""})
+                        continue
+                    devices.append(
+                        {
+                            "name": str(
+                                it.get("DeviceName")
+                                or it.get("deviceName")
+                                or it.get("name")
+                                or "未知设备"
+                            ),
+                            "id": str(
+                                it.get("DeviceId")
+                                or it.get("deviceId")
+                                or it.get("id")
+                                or ""
+                            ),
+                            "time": str(
+                                it.get("LoginTime")
+                                or it.get("loginTime")
+                                or it.get("LoginAt")
+                                or it.get("lastLoginTime")
+                                or it.get("UpdatedAt")
+                                or ""
+                            ),
+                            "status": str(
+                                it.get("Status") or it.get("status") or ""
+                            ),
+                            "platform": str(
+                                it.get("Platform")
+                                or it.get("platform")
+                                or it.get("DeviceType")
+                                or it.get("deviceType")
+                                or ""
+                            ),
+                        }
+                    )
+                results.append(
+                    {
+                        "name": acc.name,
+                        "ok": True,
+                        "count": len(devices),
+                        "devices": devices,
+                    }
+                )
+            except Exception as e:
+                results.append(
+                    {
+                        "name": acc.name,
+                        "ok": False,
+                        "count": 0,
+                        "devices": [],
+                        "message": f"获取设备列表失败: {e}",
+                    }
+                )
+        return results
+
     # ==================== 一键均衡 ====================
 
     def balance(self, max_items: int = 20) -> Dict:

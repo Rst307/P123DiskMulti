@@ -468,6 +468,21 @@ class FakeP123Client:
             },
         }
 
+    def user_device_list(self, payload=None, base_url="", **kwargs):
+        """模拟设备列表（user/device_list）：默认一台设备，测试可改 self.devices"""
+        devices = getattr(self, "devices", None)
+        if devices is None:
+            devices = [
+                {
+                    "DeviceName": "Edge浏览器",
+                    "DeviceId": "dev-1",
+                    "LoginTime": "2026-07-01 10:00:00",
+                    "Status": "0",
+                    "Platform": "web",
+                }
+            ]
+        return {"code": 0, "data": {"list": [dict(d) for d in devices]}}
+
     def share_list(self, payload, base_url="", **kwargs):
         """模拟分享列表（share/list）：分页返回，最新优先"""
         page = max(1, int(payload.get("Page", 1)))
@@ -976,6 +991,29 @@ def _run_tests():
     print("== 14. 快照 ==")
     snap = api.snapshot(Path("/盘B/剧集"))
     check("/盘B/剧集/S01/E01.mkv" in snap, "快照包含盘B剧集文件")
+
+    print("== 15. 设备列表 ==")
+    devs = api.device_list()
+    check(len(devs) == len(api._accounts), "每个账号返回设备列表")
+    check(all(d["ok"] for d in devs), "设备列表获取成功")
+    check(devs[0]["count"] == 1, f"账号包含设备记录: {devs[0]['count']}")
+    check(
+        devs[0]["devices"][0]["name"] == "Edge浏览器"
+        and devs[0]["devices"][0]["id"] == "dev-1",
+        "设备字段解析正确",
+    )
+    # 多设备 + 字段缺失兜底
+    fake_dev_a = [
+        {"DeviceName": "手机", "DeviceId": "dev-a", "LoginTime": "2026-06-01"},
+        {"DeviceName": "电脑", "DeviceId": "dev-b"},
+        {"unknown": "raw"},
+    ]
+    acc_a.client._fake.devices = fake_dev_a
+    devs = api.device_list()
+    d0 = [d for d in devs if d["name"] == "盘A"][0]
+    check(d0["count"] == 3, "多设备记录解析")
+    check(d0["devices"][0]["platform"] == "", "缺失字段兜底为空")
+    check(d0["devices"][2]["name"] == "未知设备", "未知字段设备显示未知设备")
 
     print()
     print(f"结果: {passed} 通过, {failed} 失败")
