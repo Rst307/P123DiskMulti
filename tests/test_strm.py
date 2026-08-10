@@ -163,16 +163,51 @@ item = make_target_item("/盘A/电影/新电影.mkv", "新电影.mkv", 5000, "md
 strm_path = helper.handle_transfer_complete(item, "/盘A/电影", mappings_text)
 check(strm_path is not None and strm_path.name == "新电影.strm", f"入库生成 STRM: {strm_path}")
 check("s3_key_flag=s3-new" in strm_path.read_text(encoding="utf-8"), "STRM 内容正确")
-# 5.2 蓝光目录跳过
+# 5.2 跨盘整理：target_item 可能仍带源盘路径，目标目录才是最终网盘
+cross_item = make_target_item(
+    "/盘A/电影/跨盘.mkv", "跨盘.mkv", 6000, "md5-cross", "s3-cross"
+)
+cross_strm = helper.handle_transfer_complete(
+    cross_item, "/盘B/电影", mappings_text
+)
+check(
+    cross_strm == local_b / "跨盘.strm",
+    "跨盘整理按目标目录生成 STRM，而不是写入源盘目录",
+)
+cross_url = cross_strm.read_text(encoding="utf-8") if cross_strm else ""
+check(
+    "disk=%E7%9B%98B" in cross_url and "disk=%E7%9B%98A" not in cross_url,
+    "跨盘整理 STRM 的 disk 参数使用目标盘",
+)
+# 跨盘且事件缺少 pickcode 时，也必须按目标盘路径补查
+cross_lookup_item = FileItem(
+    storage="123云盘",
+    path="/盘A/电影/流浪地球.mkv",
+    name="流浪地球.mkv",
+    type="file",
+)
+cross_lookup_strm = helper.handle_transfer_complete(
+    cross_lookup_item, "/盘B/电影", mappings_text
+)
+cross_lookup_url = (
+    cross_lookup_strm.read_text(encoding="utf-8") if cross_lookup_strm else ""
+)
+check(
+    cross_lookup_strm == local_b / "流浪地球.strm"
+    and "md5-wl" in cross_lookup_url
+    and "disk=%E7%9B%98B" in cross_lookup_url,
+    "跨盘整理缺少 pickcode 时按目标盘路径补查文件信息",
+)
+# 5.4 蓝光目录跳过
 item_bd = make_target_item("/盘A/电影/BDMV/index.bdmv", "index.bdmv", 1, "m", "s")
 check(helper.handle_transfer_complete(item_bd, "/盘A/电影/BDMV", mappings_text) is None, "蓝光原盘跳过")
-# 5.3 非媒体跳过
+# 5.5 非媒体跳过
 item_sub = make_target_item("/盘A/电影/新电影.srt", "新电影.srt", 10, "m2", "s2")
 check(helper.handle_transfer_complete(item_sub, "/盘A/电影", mappings_text) is None, "非媒体文件跳过")
-# 5.4 路径不匹配跳过
+# 5.6 路径不匹配跳过
 item_out = make_target_item("/盘A/纪录片/E02.mkv", "E02.mkv", 10, "m3", "s3")
 check(helper.handle_transfer_complete(item_out, "/盘A/纪录片", mappings_text) is None, "未匹配输出目录跳过")
-# 5.5 整理事件偶尔不带 pickcode，但目标文件已在网盘，应回查完整信息
+# 5.7 整理事件偶尔不带 pickcode，但目标文件已在网盘，应回查完整信息
 item_event_no_pickcode = FileItem(
     storage="123云盘",
     path="/盘A/电影/阿凡达.mkv",

@@ -9,7 +9,7 @@ P123DiskMulti STRM 助手模块（多盘）
 
 设计原则（可维护 / 可扩展）：
 - 只依赖 P123MultiApi（存储层）与 MoviePilot 基础设施，不依赖插件主类
-- 文件信息统一取自 FileItem.pickcode（123 原始数据：FileName/Size/Etag/S3KeyFlag）
+- 文件信息优先取自 FileItem.pickcode，整理事件缺失时按最终路径回查（123 原始数据：FileName/Size/Etag/S3KeyFlag）
 - 路径映射格式与 p123strmhelper 一致：本地STRM目录#网盘媒体库目录（每行一条）
 - 新增能力（分享 STRM / 媒体信息下载 / 字幕伴随文件）只需在此模块添加方法
 """
@@ -610,7 +610,7 @@ class StrmHelper:
         """
         处理 MoviePilot 转移完成事件，为入库文件生成 STRM
 
-        :param target_item: 转移后的目标文件项（缺少 pickcode 时按路径补查）
+        :param target_item: 转移后的目标文件项（跨盘时 path 可能仍是源盘路径，缺少 pickcode 时按最终路径补查）
         :param target_diritem_path: 转移目标目录路径
         :param paths_text: 路径映射配置（本地STRM目录#网盘媒体库目录）
         :return: 生成的 STRM 文件路径，未生成返回 None
@@ -626,25 +626,27 @@ class StrmHelper:
                 f"【123多盘STRM】{target_item.path} 为蓝光原盘目录，跳过"
             )
             return None
-        # 先匹配路径，未配置监控的目录不必向网盘发起补查请求
+        # 跨盘整理时 target_item.path 可能仍是源盘路径，目标目录才是最终位置
+        target_path = self._target_file_path(target_item, target_diritem_path)
+        # 先匹配目标路径，未配置监控的目录不必向网盘发起补查请求
         local_dir, pan_dir = self.match_media_path(
-            target_item.path, self.parse_mappings(paths_text)
+            target_path, self.parse_mappings(paths_text)
         )
         if not local_dir:
             logger.debug(
-                f"【123多盘STRM】{target_item.path} 未匹配到 STRM 输出目录，跳过"
+                f"【123多盘STRM】{target_path} 未匹配到 STRM 输出目录，跳过"
             )
             return None
-        # 整理完成事件偶尔只带基础 FileItem，按目标路径回查 123 原始文件信息
+        # 整理完成事件偶尔只带基础 FileItem，按最终路径回查 123 原始文件信息
         info = self._extract_file_info(target_item)
         if not info:
-            info = self._lookup_file_info(target_item)
+            info = self._lookup_file_info(target_item, target_path)
         if not info:
             logger.warn(
-                f"【123多盘STRM】{target_item.path} 缺少网盘文件信息，无法生成 STRM"
+                f"【123多盘STRM】{target_path} 缺少网盘文件信息，无法生成 STRM"
             )
             return None
-        rel_path = self._relative_path(target_item.path, pan_dir)
+        rel_path = self._relative_path(target_path, pan_dir)
         if not rel_path:
             return None
         strm_path = Path(local_dir) / rel_path.parent / (rel_path.stem + ".strm")
@@ -653,7 +655,7 @@ class StrmHelper:
             size=info["size"],
             md5=info["md5"],
             s3_key_flag=info["s3_key_flag"],
-            disk_name=self._disk_of(target_item.path),
+            disk_name=self._disk_of(target_path),
         )
         if not url:
             return None
@@ -724,22 +726,32 @@ class StrmHelper:
             return best
         return None, None
 
-    def _lookup_file_info(self, fileitem: FileItem) -> Optional[Dict]:
-        """整理事件缺少 pickcode 时，按已落盘路径回查 123 文件详情"""
-        if not self._api or not fileitem or not fileitem.path:
+    @staticmethod
+    def _target_file_path(target_item: FileItem, target_diritem_path: str) -> str:
+        """组合整理完成事件的最终文件路径，目标目录优先于旧文件路径"""
+        raw_dir = str(target_diritem_path or "").replace("\\", "/").strip()
+        if raw_dir and target_item.name:
+            target_dir = PurePosixPath(raw_dir)
+            return str(target_dir / target_item.name)
+        return str(target_item.path)
+
+    def _lookup_file_info(
+        self, fileitem: FileItem, lookup_path: Optional[str] = None
+    ) -> Optional[Dict]:
+        """整理事件缺少 pickcode 时，按最终路径回查 123 文件详情"""
+        path = str(lookup_path or (fileitem.path if fileitem else "") or "")
+        if not self._api or not path:
             return None
         try:
-            refreshed = self._api.get_item(Path(str(fileitem.path)))
+            refreshed = self._api.get_item(Path(path))
             info = self._extract_file_info(refreshed)
             if info:
                 logger.debug(
-                    f"【123多盘STRM】整理事件文件信息不完整，已按路径补齐: {fileitem.path}"
+                    f"【123多盘STRM】整理事件文件信息不完整，已按路径补齐: {path}"
                 )
             return info
         except Exception as e:
-            logger.debug(
-                f"【123多盘STRM】按路径补查文件信息失败 {fileitem.path}: {e}"
-            )
+            logger.debug(f"【123多盘STRM】按路径补查文件信息失败 {path}: {e}")
             return None
 
     # ==================== 文件工具 ====================
