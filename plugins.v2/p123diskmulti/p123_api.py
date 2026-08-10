@@ -1,10 +1,10 @@
 import ast
 import threading
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from hashlib import md5
-from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from pathlib import Path, PurePosixPath
+from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 from p123client import check_response
@@ -17,6 +17,17 @@ from app.schemas.exception import StorageQueryError
 from app.utils.string import StringUtils
 
 from .tool import P123AutoClient, TokenStore
+
+# 分享相关 API 统一走 web 前端通道（与 self_share 一致，风控最宽松；
+# yun.123pan.com 为第三方挂载专用通道，风控严格，不用于本功能）
+SHARE_API_BASE = "https://api.123278.com/b"
+# 临时分享有效期（天）：跨盘互传转存完成后立即取消，此值仅作兜底
+TEMP_SHARE_EXPIRE_DAYS = 1
+# 单批转存文件数（保守，123 限制 100）
+TEMP_BATCH_SIZE = 50
+# 转存确认轮询次数与间隔（秒）（123 转存为异步执行，与 share.py 一致）
+SHARE_CONFIRM_ATTEMPTS = 6
+SHARE_CONFIRM_INTERVAL = 2.0
 
 
 class DiskAccount:
@@ -81,17 +92,21 @@ class P123MultiApi:
         disk_name: str = "123云盘",
         reserve_size: int = 0,
         auto_switch: bool = True,
+        use_share_transfer: bool = True,
     ):
         """
         :param disks: 网盘账号列表
         :param disk_name: 存储名称
         :param reserve_size: 每个网盘预留空间（字节），剩余空间低于该值视为空间不足
         :param auto_switch: 是否启用空间不足自动切换网盘
+        :param use_share_transfer: 跨盘互传是否优先使用「临时分享 + 服务器端直传」
+            （不占本地带宽）；分享通道不可用时自动回退 下载->上传
         """
         self._disk_name = disk_name
         self._accounts: List[DiskAccount] = disks or []
         self._reserve_size = int(reserve_size or 0)
         self._auto_switch = auto_switch
+        self._use_share_transfer = bool(use_share_transfer)
         self.transtype = {"move": "移动", "copy": "复制"}
         self._usage_cache: Dict[str, Tuple[float, Tuple[int, int]]] = {}
 
@@ -1176,12 +1191,36 @@ class P123MultiApi:
         """
         跨网盘复制（keep_source=False 时为移动）
 
+        优先走「源盘建临时分享 + 目标盘服务器端直传」（share_fs_copy，
+        云端到云端，不占本地带宽/临时空间）；分享通道不可用时
+        自动回退 下载->上传（占本地临时空间）。
+
         :param fileitem: 源文件项
         :param dst_parent_vpath: 目标父目录虚拟路径
         :param new_name: 目标文件名
         :param keep_source: 是否保留源文件
         :return: 是否成功
         """
+        src_account, _ = self._split(fileitem.path)
+        dst_account, _ = self._split(str(dst_parent_vpath))
+        if src_account is None or dst_account is None:
+            logger.error(
+                f"【123多盘】无效的跨盘复制路径: {fileitem.path} -> {dst_parent_vpath}"
+            )
+            return False
+        # 分享直传主路径（仅跨盘时可用）
+        if self._use_share_transfer and src_account is not dst_account:
+            try:
+                if self._share_transfer(
+                    src_account, fileitem, dst_parent_vpath, new_name, keep_source
+                ):
+                    return True
+            except Exception as e:
+                logger.warn(f"【123多盘】分享直传异常: {e}")
+            logger.info(
+                f"【123多盘】分享直传不可用，回退本地中转: {fileitem.path} -> {dst_parent_vpath}"
+            )
+        # 回退：下载->上传
         try:
             if fileitem.type == "dir":
                 # 目录：递归复制
@@ -1216,6 +1255,377 @@ class P123MultiApi:
                 f"【123多盘】跨网盘复制失败: {fileitem.path} -> {dst_parent_vpath} - {e}"
             )
             return False
+
+    # ==================== 跨盘互传（临时分享 + 服务器端直传） ====================
+
+    def _temp_share_expire(self) -> str:
+        """临时分享过期时间（ISO 格式，与 self_share 永久值格式一致）"""
+        return (datetime.now() + timedelta(days=TEMP_SHARE_EXPIRE_DAYS)).strftime(
+            "%Y-%m-%dT%H:%M:%S+08:00"
+        )
+
+    @staticmethod
+    def _share_name(raw: str) -> str:
+        """分享名称：须 <35 字符且不含特殊字符（123 限制）"""
+        name = str(raw or "转存").strip()
+        for ch in '"\\/:*?|><':
+            name = name.replace(ch, "_")
+        return name[:34] or "转存"
+
+    def _create_temp_share(
+        self, account: DiskAccount, fileitem: schemas.FileItem, name: str
+    ) -> Optional[Dict[str, str]]:
+        """
+        在源账号创建临时分享（web 通道 api.123278.com/b，与自分享一致）
+
+        :return: {share_id, share_key, share_pwd}；失败返回 None
+        """
+        try:
+            resp = account.client.share_create(
+                {
+                    "fileIdList": str(fileitem.fileid),
+                    "shareName": self._share_name(name),
+                    "sharePwd": "",
+                    # 无提取码（自己转存，无需密码）
+                    "fillPwdSwitch": 0,
+                    "expiration": self._temp_share_expire(),
+                    # 关闭免登录流量限制（转存不受影响，与自分享一致）
+                    "trafficLimitSwitch": 1,
+                    "trafficSwitch": 1,
+                },
+                base_url=SHARE_API_BASE,
+            )
+            check_response(resp)
+            data = resp.get("data") or {}
+            share_id = str(
+                data.get("ShareId") or data.get("shareId") or data.get("share_id") or ""
+            )
+            share_key = str(
+                data.get("ShareKey") or data.get("shareKey") or data.get("share_key") or ""
+            )
+            if not share_key:
+                logger.error(f"【123多盘】创建临时分享未返回 shareKey: {fileitem.path}")
+                return None
+            logger.info(
+                f"【123多盘】已创建临时分享 {share_key}（{fileitem.path}）"
+            )
+            return {"share_id": share_id, "share_key": share_key, "share_pwd": ""}
+        except Exception as e:
+            logger.warn(f"【123多盘】创建临时分享失败: {fileitem.path} - {e}")
+            return None
+
+    def _cancel_temp_share(self, account: DiskAccount, share_id: str):
+        """取消临时分享（转存完成后清理，失败仅记日志）"""
+        if not share_id:
+            return
+        try:
+            account.client.share_cancel(share_id, base_url=SHARE_API_BASE)
+            logger.info(f"【123多盘】已取消临时分享 {share_id}")
+        except Exception as e:
+            logger.warn(f"【123多盘】取消临时分享失败（忽略）: {e}")
+
+    def _walk_share(
+        self, account: DiskAccount, share_key: str, share_pwd: str
+    ) -> List[Dict[str, object]]:
+        """
+        递归分页遍历临时分享内容（源盘账号客户端）
+
+        :return: [{rel_path, name, file_id, etag, size, parent_file_id, is_dir}, ...]
+        """
+        result: List[Dict[str, object]] = []
+        visited: set = set()
+
+        def walk(parent_id: Any, parent_path: str) -> None:
+            if str(parent_id) in visited:
+                return
+            visited.add(str(parent_id))
+            page = 1
+            while True:
+                resp = account.client.share_fs_list(
+                    {
+                        "ShareKey": share_key,
+                        "SharePwd": share_pwd,
+                        "parentFileId": parent_id,
+                        "limit": 100,
+                        "Page": page,
+                    },
+                    base_url=SHARE_API_BASE,
+                )
+                check_response(resp)
+                data = resp.get("data") or {}
+                items = (
+                    data.get("InfoList")
+                    or data.get("infoList")
+                    or data.get("list")
+                    or []
+                )
+                if not items:
+                    break
+                for raw in items:
+                    is_dir = str(raw.get("Type", 0)) in ("1", "True") or bool(
+                        raw.get("is_dir")
+                    )
+                    name = str(raw.get("FileName") or raw.get("name") or "")
+                    path = str(PurePosixPath(parent_path) / name)
+                    item = {
+                        "rel_path": path,
+                        "name": name,
+                        "file_id": str(
+                            raw.get("FileId") or raw.get("file_id") or ""
+                        ),
+                        "etag": str(raw.get("Etag") or raw.get("etag") or ""),
+                        "size": int(raw.get("Size") or raw.get("size") or 0),
+                        "parent_file_id": str(
+                            raw.get("ParentFileId")
+                            or raw.get("parent_file_id")
+                            or "0"
+                        ),
+                        "is_dir": is_dir,
+                    }
+                    if is_dir:
+                        walk(item["file_id"], path)
+                    result.append(item)
+                if len(items) < 100 or str(data.get("Next") or "") == "-1":
+                    break
+                page += 1
+
+        walk(0, "/")
+        return result
+
+    @staticmethod
+    def _share_rel(rel_path: str, name: str) -> str:
+        """分享内路径去掉顶层目录名 -> 目标相对路径（重命名目录时顶层名与目标名无关）"""
+        rel = str(rel_path or "").lstrip("/")
+        parts = rel.split("/", 1)
+        return parts[1] if len(parts) > 1 else name
+
+    def _share_transfer(
+        self,
+        src_account: DiskAccount,
+        fileitem: schemas.FileItem,
+        dst_parent_vpath: Path,
+        new_name: str,
+        keep_source: bool,
+    ) -> bool:
+        """
+        跨盘转存（服务器端直传）：源盘建临时分享 -> 目标盘遍历并按目录结构
+        批量 share_fs_copy 转存 -> 确认落盘 -> 取消分享；移动时删除源
+
+        :param src_account: 源网盘账号
+        :param fileitem: 源文件项（文件或目录）
+        :param dst_parent_vpath: 目标父目录虚拟路径（带盘前缀）
+        :param new_name: 目标名称（move 重命名时可能与原名不同）
+        :param keep_source: False 时转存成功后删除源（移动）
+        :return: 是否成功（失败时上层回退下载上传）
+        """
+        share = None
+        try:
+            # 1. 空间预检（服务器端直传也消耗目标盘空间），不足自动切换网盘
+            need = self._item_size(fileitem)
+            dst_account, dst_real = self._split(str(dst_parent_vpath))
+            if dst_account is None:
+                dst_account = self._pick_disk(need_size=need)
+                if not dst_account:
+                    logger.error(
+                        f"【123多盘】没有可用网盘转存 {new_name}（{StringUtils.str_filesize(need)}）"
+                    )
+                    return False
+                dst_parent_vpath = Path(f"/{dst_account.name}{dst_real}")
+            elif not self._has_space(dst_account, need):
+                if self._auto_switch:
+                    alt = self._pick_disk(need_size=need, exclude=dst_account)
+                    if alt:
+                        logger.info(
+                            f"【123多盘】{dst_account.name} 空间不足（需 "
+                            f"{StringUtils.str_filesize(need)}），转存自动切换到 {alt.name}"
+                        )
+                        dst_account = alt
+                        # 保留盘内目录结构（与上传自动切换一致）
+                        dst_parent_vpath = Path(f"/{alt.name}{dst_real}")
+                    else:
+                        logger.error(
+                            f"【123多盘】{dst_account.name} 空间不足，且没有其他网盘能容纳 "
+                            f"{new_name}（{StringUtils.str_filesize(need)}），转存失败"
+                        )
+                        return False
+                else:
+                    logger.error(
+                        f"【123多盘】{dst_account.name} 剩余空间不足，未启用自动切换，转存失败"
+                    )
+                    return False
+
+            # 2. 源账号建临时分享
+            share = self._create_temp_share(src_account, fileitem, new_name)
+            if not share:
+                return False
+            share_key = share["share_key"]
+            share_pwd = share["share_pwd"]
+
+            # 切盘后目标与源相同（同盘同路径，如 move 到目标盘后因空间不足
+            # 又切回源盘）：移动语义下原地不动，直接视为成功，避免误删源
+            dst_target = Path(str(dst_parent_vpath)) / new_name
+            if dst_account is src_account and str(dst_target) == str(
+                Path(fileitem.path)
+            ):
+                logger.info(
+                    f"【123多盘】切盘后目标与源相同，无需转存: {fileitem.path}"
+                )
+                return True
+
+            # 3. 源账号遍历临时分享，目标账号按目录结构批量转存
+            # （遍历用源盘凭据：分享由源盘创建且快照在源盘侧，与 self_share 一致；
+            #  转存 share_fs_copy 用目标盘凭据，文件落到目标盘）
+            items = self._walk_share(src_account, share_key, share_pwd)
+            if fileitem.type == "dir":
+                # 目录：目标根 = 目标父目录/新名称，分享内相对路径逐级重建
+                target_root = dst_target
+            else:
+                # 单文件分享：分享内根文件 -> 目标 新名称
+                target_root = Path(str(dst_parent_vpath))
+                for it in items:
+                    if not it["is_dir"]:
+                        it["rel_path"] = f"/{new_name}"
+            files = [it for it in items if not it["is_dir"]]
+            if not files and fileitem.type == "dir":
+                # 空目录：只需建目录
+                ok = self.get_folder(target_root) is not None
+            else:
+                ok = self._transfer_files(
+                    dst_account, items, share_key, share_pwd, target_root
+                )
+            if not ok:
+                logger.error(
+                    f"【123多盘】分享转存失败: {fileitem.path} -> {dst_parent_vpath}"
+                )
+                return False
+
+            # 4. 移动时删除源（转存已确认落盘）
+            if not keep_source:
+                self.delete(fileitem)
+            return True
+        except Exception as e:
+            logger.warn(f"【123多盘】分享直传异常: {e}")
+            return False
+        finally:
+            if share:
+                self._cancel_temp_share(src_account, share["share_id"])
+
+    def _transfer_files(
+        self,
+        dst_account: DiskAccount,
+        items: List[Dict[str, object]],
+        share_key: str,
+        share_pwd: str,
+        target_root: Path,
+    ) -> bool:
+        """
+        把分享内文件批量转存到目标目录（保留相对目录结构）
+
+        目录结构用 get_folder 逐级创建（不存在则建），文件按目标父目录
+        分组批量 share_fs_copy（123 单批上限 100）。
+        """
+        files = [it for it in items if not it["is_dir"]]
+        # 1. 先建目录结构
+        for d in items:
+            if not d["is_dir"]:
+                continue
+            rel = self._share_rel(d["rel_path"], d["name"])
+            if not rel:
+                continue
+            target_dir = Path(target_root) / rel
+            if not self.get_folder(target_dir):
+                logger.error(f"【123多盘】创建目标目录失败: {target_dir}")
+                return False
+        # 2. 按目标父目录分组转存
+        by_parent: Dict[str, List[Dict[str, object]]] = {}
+        for f in files:
+            rel = self._share_rel(f["rel_path"], f["name"])
+            target = Path(target_root) / rel
+            by_parent.setdefault(str(PurePosixPath(target).parent), []).append(
+                {"file": f, "target": target}
+            )
+        for _parent, group in by_parent.items():
+            parent_item = self.get_folder(PurePosixPath(_parent))
+            if not parent_item:
+                logger.error(f"【123多盘】获取目标目录失败: {_parent}")
+                return False
+            for offset in range(0, len(group), TEMP_BATCH_SIZE):
+                chunk = group[offset:offset + TEMP_BATCH_SIZE]
+                if not self._transfer_batch(
+                    dst_account, chunk, share_key, share_pwd, parent_item
+                ):
+                    return False
+        return True
+
+    def _transfer_batch(
+        self,
+        dst_account: DiskAccount,
+        chunk: List[Dict[str, object]],
+        share_key: str,
+        share_pwd: str,
+        parent_item: schemas.FileItem,
+    ) -> bool:
+        """
+        提交一批 share_fs_copy 转存并轮询确认落盘
+
+        :param chunk: [{"file": 分享文件 dict, "target": 目标完整路径 Path}, ...]
+        :return: 是否全部确认成功
+        """
+        # 目标存在同名先删除（避免 123 转存同名冲突；移动/复制覆盖语义）
+        for entry in chunk:
+            target = entry["target"]
+            existing = self.get_item(PurePosixPath(target))
+            if existing:
+                logger.info(f"【123多盘】目标已存在同名文件，先删除: {target}")
+                self.delete(existing)
+        file_list = []
+        for entry in chunk:
+            f = entry["file"]
+            file_list.append(
+                {
+                    "file_id": f["file_id"],
+                    "file_name": PurePosixPath(entry["target"]).name,
+                    "etag": f["etag"],
+                    "parent_file_id": f["parent_file_id"],
+                    "size": f["size"],
+                }
+            )
+        try:
+            resp = dst_account.client.share_fs_copy(
+                {
+                    "share_key": share_key,
+                    "share_pwd": share_pwd,
+                    "file_list": file_list,
+                },
+                parent_id=parent_item.fileid,
+            )
+            check_response(resp)
+        except Exception as e:
+            logger.error(f"【123多盘】转存请求失败: {e}")
+            return False
+        # 轮询确认（123 转存为异步执行）
+        unresolved = {
+            str(entry["target"]): entry for entry in chunk
+        }
+        for _attempt in range(SHARE_CONFIRM_ATTEMPTS):
+            for target in list(unresolved):
+                if global_vars.is_transfer_stopped(target):
+                    logger.info(f"【123多盘】{target} 转存确认已取消")
+                    return False
+                if self.get_item(PurePosixPath(target)):
+                    unresolved.pop(target)
+            if not unresolved:
+                break
+            if SHARE_CONFIRM_INTERVAL:
+                time.sleep(SHARE_CONFIRM_INTERVAL)
+        if unresolved:
+            logger.error(
+                f"【123多盘】转存确认超时，未落盘: {list(unresolved)}"
+            )
+            return False
+        # 转存占用目标盘空间，刷新空间缓存
+        self._invalidate_usage(dst_account)
+        return True
 
     def _copy_dir_recursive(
         self, src_dir_item: schemas.FileItem, dst_dir_item: schemas.FileItem

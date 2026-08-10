@@ -198,8 +198,10 @@ class FakeP123Client:
         self.shares = []          # 已创建的分享列表
         self.share_create_calls = []
         self.share_cancel_calls = []
+        self.share_copy_calls = []  # share_fs_copy 调用记录（跨盘分享直传用）
         self.fail_share_create = False
         self.fail_share_fs_list_once = False
+        self.share_entries = None  # 分享内文件树（None 时建分享自动快照）
         # 按需分享（OnDemand 测试用）
         self.upload_request_calls = []
         self.fs_list_new_calls = []
@@ -385,6 +387,11 @@ class FakeP123Client:
 
     def share_fs_copy(self, payload, parent_id=0, base_url="", **kwargs):
         """模拟分享转存（服务器端直传）：把文件复制到目标盘"""
+        self.share_copy_calls.append({
+            "payload": dict(payload),
+            "parent_id": parent_id,
+            "base_url": base_url,
+        })
         if getattr(self, "fail_share_copy", False):
             raise RuntimeError("fake share copy failed")
         if getattr(self, "defer_share_copy", False):
@@ -395,13 +402,53 @@ class FakeP123Client:
                         size=item.get("size") or 0, etag=item.get("etag") or "")
         return {"code": 0}
 
+    def _snapshot_share(self, file_id_list):
+        """
+        建分享时把网盘内文件/目录子树快照进 share_entries（分享内独立 id 空间）
+
+        与真实 123 一致：分享内 FileId/ParentFileId 与源盘不同，
+        转存时 file_list 的 parent_file_id 必须用分享内 id。
+        """
+        entries = {}
+        id_map = {}
+        next_id = [9001]
+
+        def snap(e):
+            eid = int(e["FileId"])
+            if eid in id_map:
+                return id_map[eid]
+            sid = next_id[0]
+            next_id[0] += 1
+            id_map[eid] = sid
+            entry = dict(e)
+            entry["FileId"] = sid
+            entry["ParentFileId"] = id_map.get(
+                int(entry.get("ParentFileId") or 0), 0
+            )
+            entries.setdefault(entry["ParentFileId"], []).append(entry)
+            if entry["Type"] == 1:
+                for child in self._children(eid):
+                    snap(child)
+            return sid
+
+        for raw in str(file_id_list or "").split(","):
+            raw = raw.strip()
+            if not raw:
+                continue
+            e = self.entries.get(int(raw))
+            if e:
+                snap(e)
+        return entries
+
     # ---------- 自分享 API（SelfShare 测试用） ----------
 
     def share_create(self, payload, base_url="", **kwargs):
-        """模拟建分享（web 通道）：记录调用并生成分享"""
+        """模拟建分享（web 通道）：记录调用并生成分享；
+        每次建分享都重新快照网盘内容（与真实 123 一致，多盘互传用）"""
         self.share_create_calls.append({"payload": dict(payload), "base_url": base_url})
         if getattr(self, "fail_share_create", False):
             return {"code": 1, "message": "share create failed"}
+        self.share_entries = self._snapshot_share(payload.get("fileIdList", ""))
         eid = self._new_id()
         share = {
             "ShareId": eid,
@@ -700,15 +747,33 @@ def _run_tests():
     new_item3 = api.upload(FileItem(storage="123云盘", path="/自动目录/", type="dir"), tmp, "电影3.mkv")
     check(new_item3 is not None and str(new_item3.path).startswith("/盘B/"), f"自动分配到剩余空间最大网盘: {new_item3.path}")
 
-    print("== 8. 跨网盘移动 ==")
-    # 把盘B根目录的 新电影.mkv 移动到 盘A/电影
+    print("== 8. 跨网盘移动（临时分享 + 服务器端直传） ==")
+    # 把盘B电影目录的 新电影.mkv 移动到 盘A/电影（先恢复盘A空间，避免切盘干扰）
+    acc_a.client._fake.total = 300 * 1024 ** 3
+    acc_a.client._fake.used = 50 * 1024 ** 3
+    api._invalidate_usage()
     src = api.get_item(Path(new_item.path))
     check(src is not None, f"获取源文件: {new_item.path}")
+    acc_b.client._fake.share_create_calls.clear()
+    acc_b.client._fake.share_cancel_calls.clear()
+    acc_a.client._fake.share_copy_calls.clear()
     ok = api.move(src, Path("/盘A/电影/"), src.name)
     check(ok, "跨盘移动成功")
+    check(
+        len(acc_b.client._fake.share_create_calls) == 1,
+        "源盘建临时分享（不下载本地）",
+    )
+    check(
+        len(acc_b.client._fake.share_cancel_calls) == 1,
+        "转存完成后取消临时分享",
+    )
+    check(
+        len(acc_a.client._fake.share_copy_calls) == 1,
+        "目标盘服务器端直传转存",
+    )
     dst = api.get_item(Path("/盘A/电影/新电影.mkv"))
     check(dst is not None, "文件已出现在盘A目标目录")
-    src2 = api.get_item(Path("/盘B/新电影.mkv"))
+    src2 = api.get_item(Path("/盘B/电影/新电影.mkv"))
     check(src2 is None, "盘B源文件已删除")
 
     print("== 9. 同网盘移动 ==")
@@ -718,14 +783,24 @@ def _run_tests():
     check(api.get_item(Path("/盘A/复联.mkv")) is not None, "文件在盘A根目录")
     check(api.get_item(Path("/盘A/电影/复仇者联盟.mkv")) is None, "原位置已移除")
 
-    print("== 10. 跨网盘复制（保留源） ==")
+    print("== 10. 跨网盘复制（保留源，分享直传） ==")
     src4 = api.get_item(Path("/盘A/复联.mkv"))
+    acc_a.client._fake.share_create_calls.clear()
+    acc_a.client._fake.share_cancel_calls.clear()
     ok = api.copy(src4, Path("/盘B/电影/"), "复联副本.mkv")
     check(ok, "跨盘复制成功")
+    check(
+        len(acc_a.client._fake.share_create_calls) == 1,
+        "跨盘复制走临时分享直传",
+    )
+    check(
+        len(acc_a.client._fake.share_cancel_calls) == 1,
+        "复制后取消临时分享",
+    )
     check(api.get_item(Path("/盘A/复联.mkv")) is not None, "源文件保留")
     check(api.get_item(Path("/盘B/电影/复联副本.mkv")) is not None, "副本在盘B")
 
-    print("== 11. 目录跨盘移动 ==")
+    print("== 11. 目录跨盘移动（分享直传） ==")
     api.create_folder(FileItem(storage="123云盘", path="/盘A/", type="dir"), "剧集")
     api.create_folder(FileItem(storage="123云盘", path="/盘A/剧集/", type="dir"), "S01")
     # 往 剧集/S01 放个文件
@@ -734,10 +809,148 @@ def _run_tests():
     tmp2.write_bytes(b"y" * 1024)
     api.upload(s01, tmp2, "E01.mkv")
     tv = api.get_item(Path("/盘A/剧集"))
+    acc_a.client._fake.share_create_calls.clear()
+    acc_a.client._fake.share_cancel_calls.clear()
+    acc_b.client._fake.share_copy_calls.clear()
     ok = api.move(tv, Path("/盘B/"), "剧集")
     check(ok, "目录跨盘移动成功")
+    check(
+        len(acc_a.client._fake.share_create_calls) == 1,
+        "目录跨盘移动：源盘建一次临时分享（整目录）",
+    )
+    check(
+        len(acc_a.client._fake.share_cancel_calls) == 1,
+        "目录转存完成后取消临时分享",
+    )
+    check(
+        len(acc_b.client._fake.share_copy_calls) >= 1,
+        "目标盘批量服务器端直传",
+    )
     check(api.get_item(Path("/盘B/剧集/S01/E01.mkv")) is not None, "目录内文件递归移动")
     check(api.get_item(Path("/盘A/剧集")) is None, "盘A原目录已删除")
+
+    print("== 11.6 跨盘移动分享直传失败自动回退本地中转 ==")
+    # 源盘 B 建分享失败 -> 自动回退 下载->上传，移动仍成功
+    fake_b2 = acc_b.client._fake
+    tmp3 = Path("/tmp/test_fallback.mkv")
+    tmp3.write_bytes(b"z" * 2048)
+    dir_b = api.get_folder(Path("/盘B/电影"))
+    fb_item = api.upload(dir_b, tmp3, "回退测试.mkv")
+    check(fb_item is not None, "上传回退测试文件")
+    fake_b2.fail_share_create = True
+    fake_b2.share_create_calls.clear()
+    fake_b2.share_cancel_calls.clear()
+    ok = api.move(fb_item, Path("/盘A/电影/"), "回退测试.mkv")
+    fake_b2.fail_share_create = False
+    check(ok, "建分享失败时回退本地中转，移动仍成功")
+    check(len(fake_b2.share_create_calls) == 1, "尝试过一次建分享")
+    check(len(fake_b2.share_cancel_calls) == 0, "分享未创建成功，无需取消")
+    check(
+        api.get_item(Path("/盘A/电影/回退测试.mkv")) is not None,
+        "回退后文件到达目标盘",
+    )
+    check(
+        api.get_item(Path("/盘B/电影/回退测试.mkv")) is None,
+        "回退移动后源文件已删除",
+    )
+
+    print("== 11.7 跨盘移动目标盘空间不足，转存自动切换网盘 ==")
+    # 盘B 建文件，盘A 空间不足（恢复到 0.5MB），新增盘C -> 转存应切到盘C
+    acc_c = make_account("盘C", 300 * 1024 ** 3, 10 * 1024 ** 3)
+    api._accounts.append(acc_c)
+    acc_a.client._fake.total = 100 * 1024 * 1024
+    acc_a.client._fake.used = 99.5 * 1024 * 1024
+    api._invalidate_usage()
+    tmp4 = Path("/tmp/test_switch.mkv")
+    tmp4.write_bytes(b"w" * 1024 * 1024)  # 1MB > 盘A剩余0.5MB，触发切盘
+    dir_b2 = api.get_folder(Path("/盘B/电影"))
+    sw_item = api.upload(dir_b2, tmp4, "切换测试.mkv")
+    check(sw_item is not None, "上传切换测试文件")
+    acc_b.client._fake.share_create_calls.clear()
+    acc_b.client._fake.share_cancel_calls.clear()
+    acc_c.client._fake.share_copy_calls.clear()
+    ok = api.move(sw_item, Path("/盘A/电影/"), "切换测试.mkv")
+    check(ok, "目标盘空间不足时转存自动切换网盘，移动成功")
+    check(
+        len(acc_b.client._fake.share_create_calls) == 1,
+        "仍由源盘建临时分享",
+    )
+    check(
+        len(acc_b.client._fake.share_cancel_calls) == 1,
+        "切盘转存后取消临时分享",
+    )
+    check(
+        len(acc_c.client._fake.share_copy_calls) == 1,
+        "转存自动切到剩余空间最大的盘C",
+    )
+    check(
+        api.get_item(Path("/盘C/电影/切换测试.mkv")) is not None,
+        "文件落在盘C（原目录结构保留）",
+    )
+    check(
+        api.get_item(Path("/盘B/电影/切换测试.mkv")) is None,
+        "盘B源文件已删除",
+    )
+
+    print("== 11.8 转存选盘须满足: 剩余空间-预留空间-文件大小>0 ==")
+    # 盘A 可用 2MB，文件 1MB，预留 1.5MB：2MB < 1MB+1.5MB -> 必须切盘
+    acc_a.client._fake.total = 100 * 1024 * 1024
+    acc_a.client._fake.used = 98 * 1024 * 1024
+    api._reserve_size = int(1.5 * 1024 * 1024)
+    api._invalidate_usage()
+    tmp5 = Path("/tmp/test_reserve.mkv")
+    tmp5.write_bytes(b"v" * (1024 * 1024))
+    dir_b3 = api.get_folder(Path("/盘B/电影"))
+    rv_item = api.upload(dir_b3, tmp5, "预留测试.mkv")
+    check(rv_item is not None, "上传预留测试文件")
+    acc_b.client._fake.share_create_calls.clear()
+    acc_b.client._fake.share_cancel_calls.clear()
+    acc_c.client._fake.share_copy_calls.clear()
+    ok = api.move(rv_item, Path("/盘A/电影/"), "预留测试.mkv")
+    check(ok, "预留空间不足时转存自动切盘，移动成功")
+    check(
+        len(acc_b.client._fake.share_create_calls) == 1,
+        "仍由源盘建临时分享",
+    )
+    check(
+        len(acc_c.client._fake.share_copy_calls) == 1,
+        "2MB可用 < 1MB文件+1.5MB预留，切到盘C",
+    )
+    check(
+        api.get_item(Path("/盘C/电影/预留测试.mkv")) is not None,
+        "文件落在盘C",
+    )
+    check(
+        api.get_item(Path("/盘B/电影/预留测试.mkv")) is None,
+        "盘B源文件已删除",
+    )
+    # 对照组：预留调为 0 后同一容量不切盘（证明是预留空间导致切盘）
+    api._reserve_size = 0
+    acc_a.client._fake.used = 98 * 1024 * 1024
+    api._invalidate_usage()
+    tmp6 = Path("/tmp/test_reserve2.mkv")
+    tmp6.write_bytes(b"u" * (1024 * 1024))
+    dir_b4 = api.get_folder(Path("/盘B/电影"))
+    rv2 = api.upload(dir_b4, tmp6, "预留测试2.mkv")
+    check(rv2 is not None, "上传对照组文件")
+    acc_b.client._fake.share_create_calls.clear()
+    acc_b.client._fake.share_cancel_calls.clear()
+    acc_a.client._fake.share_copy_calls.clear()
+    acc_c.client._fake.share_copy_calls.clear()
+    ok = api.move(rv2, Path("/盘A/电影/"), "预留测试2.mkv")
+    check(ok, "预留为0且空间足够时不切盘，移动成功")
+    check(
+        len(acc_a.client._fake.share_copy_calls) == 1,
+        "预留0时 2MB可用>=1MB文件，直接在盘A转存",
+    )
+    check(
+        api.get_item(Path("/盘A/电影/预留测试2.mkv")) is not None,
+        "文件落在盘A",
+    )
+    check(
+        api.get_item(Path("/盘B/电影/预留测试2.mkv")) is None,
+        "盘B源文件已删除",
+    )
 
     print("== 12. 删除 ==")
     victim = api.get_item(Path("/盘A/电影/新电影.mkv"))
@@ -755,7 +968,10 @@ def _run_tests():
     result = api.balance(max_items=5)
     check(result["count"] == 1, f"均衡移动了 {result['count']} 个文件")
     if result["moved"]:
-        check(result["moved"][0]["to"].startswith("/盘B/"), f"旧文件移动到盘B: {result['moved'][0]}")
+        check(
+            not result["moved"][0]["to"].startswith("/盘A/"),
+            f"旧文件从盘A移到剩余空间更大的盘: {result['moved'][0]}",
+        )
 
     print("== 14. 快照 ==")
     snap = api.snapshot(Path("/盘B/剧集"))
