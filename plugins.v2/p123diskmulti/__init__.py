@@ -23,6 +23,7 @@ from .p123_api import DiskAccount, P123MultiApi
 from .self_share import SelfShareManager
 from .share import ShareSync
 from .strm import DEFAULT_MEDIA_EXTS, StrmHelper
+from .tool import TokenStore
 
 # 默认网盘名称（旧版单盘配置迁移时使用）
 LEGACY_DISK_NAME = "盘1"
@@ -45,7 +46,7 @@ class P123DiskMulti(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/DDSRem-Dev/MoviePilot-Plugins/main/icons/P123Disk.png"
     # 插件版本
-    plugin_version = "1.4.8"
+    plugin_version = "1.4.10"
     # 插件作者
     plugin_author = "Rst307"
     # 作者主页
@@ -62,6 +63,7 @@ class P123DiskMulti(_PluginBase):
     _auto_switch = True
     _reserve_size = 0
     _api: Optional[P123MultiApi] = None
+    _token_store: Optional[TokenStore] = None
     _disk_name = "123云盘"
 
     def __init__(self):
@@ -164,8 +166,13 @@ class P123DiskMulti(_PluginBase):
                 "organize_delete_better", True
             )
 
+            # 登录态持久化存储：123 token 有效期 30 天，
+            # 保存后可跨重启复用，避免每次操作都重新登录
+            self._token_store = TokenStore(
+                self.get_data_path() / "p123tokens.json"
+            )
             # 解析网盘账号列表
-            accounts = self._parse_disks(config)
+            accounts = self._parse_disks(config, self._token_store)
 
             if self._enabled:
                 # 添加云盘存储配置（不存在时）
@@ -568,7 +575,7 @@ class P123DiskMulti(_PluginBase):
         return None
 
     @staticmethod
-    def _parse_disks(config: dict) -> List[DiskAccount]:
+    def _parse_disks(config: dict, token_store=None) -> List[DiskAccount]:
         """
         解析网盘账号配置
 
@@ -591,7 +598,14 @@ class P123DiskMulti(_PluginBase):
                 logger.warn(f"【123多盘】网盘名称 {name} 重复，已忽略（名称需唯一）")
                 return
             seen_names.add(name)
-            accounts.append(DiskAccount(name=name, passport=passport, password=password))
+            accounts.append(
+                DiskAccount(
+                    name=name,
+                    passport=passport,
+                    password=password,
+                    token_store=token_store,
+                )
+            )
 
         # 1. 新版列表配置（JSON）
         disks = config.get("disks")

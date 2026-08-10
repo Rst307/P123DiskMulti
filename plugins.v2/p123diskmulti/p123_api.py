@@ -16,7 +16,7 @@ from app.modules.filemanager.storages import transfer_process
 from app.schemas.exception import StorageQueryError
 from app.utils.string import StringUtils
 
-from .tool import P123AutoClient
+from .tool import P123AutoClient, TokenStore
 
 
 class DiskAccount:
@@ -24,11 +24,17 @@ class DiskAccount:
     单个 123 网盘账号
     """
 
-    def __init__(self, name: str, passport: str, password: str):
+    def __init__(
+        self,
+        name: str,
+        passport: str,
+        password: str,
+        token_store: Optional[TokenStore] = None,
+    ):
         self.name = name
         self.passport = passport
         self.password = password
-        self.client = P123AutoClient(passport, password)
+        self.client = P123AutoClient(passport, password, token_store=token_store)
         # 盘内路径 -> FileId 缓存（真实路径，不含盘前缀）
         self._id_cache: Dict[str, str] = {}
         self._cache_lock = threading.RLock()

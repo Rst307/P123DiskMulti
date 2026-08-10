@@ -15,12 +15,14 @@
 """
 
 import errno as _errno
+import json
 import threading
 import time
+from pathlib import Path
 from typing import Callable, Dict, Iterable, List, Optional, Tuple, Union
 
 import requests
-from p123client import P123Client, check_response
+from p123client import P123Client, P123AuthenticationError, check_response
 
 from app.log import logger
 
@@ -60,6 +62,9 @@ _DEFAULT_PROBE_TIMEOUT = 8
 DEFAULT_URL_CACHE_TTL = 600
 # 缓存条目上限（防内存无界增长）
 _URL_CACHE_MAX = 256
+# 自动重登冷却（秒）：token 失效触发的 401 自愈重登间隔下限，
+# 防止「401 -> 重登 -> 再 401」循环在短时间内产生大量登录（设备管理暴涨）
+_RELOGIN_COOLDOWN = 60
 
 
 def _label(base: str) -> str:
@@ -318,59 +323,222 @@ def exchange_and_validate(
     return None
 
 
+class TokenStore:
+    """
+    账号登录 token 持久化存储（JSON 文件，按 passport 隔离）
+
+    123 登录 token 有效期 30 天；把 token 存入插件数据目录后，
+    进程重启 / 插件重载 / 日常操作都能直接复用登录态，
+    不再每次操作都重新登录（123 设备管理里的登录记录也因此不再暴涨）。
+    """
+
+    _lock = threading.Lock()
+
+    def __init__(self, path: Optional[Union[str, Path]] = None):
+        self._path = Path(path) if path else None
+        self._tokens: Dict[str, str] = self._load()
+
+    def _load(self) -> Dict[str, str]:
+        if not self._path or not self._path.exists():
+            return {}
+        try:
+            data = json.loads(self._path.read_text("utf-8"))
+            return data if isinstance(data, dict) else {}
+        except Exception:
+            return {}
+
+    def get(self, passport: str) -> str:
+        """取账号已保存的 token（无则空串）"""
+        with self._lock:
+            token = self._tokens.get(str(passport))
+            return str(token) if token else ""
+
+    def set(self, passport: str, token: str):
+        """保存账号 token（原子写入）"""
+        if not token:
+            return
+        with self._lock:
+            self._tokens[str(passport)] = token
+            self._flush()
+
+    def _flush(self):
+        if not self._path:
+            return
+        try:
+            tmp = self._path.with_name(self._path.name + ".tmp")
+            tmp.write_text(
+                json.dumps(self._tokens, ensure_ascii=False, indent=2),
+                "utf-8",
+            )
+            tmp.replace(self._path)
+        except Exception as e:
+            logger.warn(f"【123多盘】登录 token 持久化失败: {e}")
+
+
 class P123AutoClient:
     """
     123云盘客户端
 
-    懒实例化；代理调用时自动处理 Token 超限重连；
-    附带下载换链域名状态（工作域名/失败冷却），支持通道风控自动切换。
+    - 懒实例化且线程安全：同一账号全局唯一客户端，并发操作不会并发登录
+    - 登录态持久化复用：优先用已保存的 token 构造客户端（不登录），
+      仅当 token 确实失效（401/认证异常）时才重登，且自动重登带冷却合并
+    - 「token 数量超限」类 401 不触发重登（重登只会产生更多 token）
+    - 附带下载换链域名状态（工作域名/失败冷却），支持通道风控自动切换
     """
 
-    def __init__(self, passport: str, password: str):
-        self._client = None
+    def __init__(
+        self,
+        passport: str,
+        password: str,
+        token_store: Optional[TokenStore] = None,
+    ):
         self._passport = passport
         self._password = password
+        self._token_store = token_store
+        self._client = None
+        # 保护客户端创建/重登的互斥锁（并发操作不产生并发登录）
+        self._lock = threading.Lock()
+        # 最近一次强制重登时间（自动重登冷却用）
+        self._last_relogin = 0.0
         # 下载换链域名状态（按账号隔离）
         self._dl_state = DownloadTicketState(None)
 
+    # ==================== 客户端生命周期 ====================
+
+    def _create_client(self) -> P123Client:
+        """构造底层客户端：优先复用已保存 token（构造不触发登录）"""
+        saved = (
+            self._token_store.get(self._passport) if self._token_store else ""
+        )
+        if saved:
+            try:
+                return P123Client(
+                    self._passport,
+                    self._password,
+                    token=saved,
+                    check_for_relogin=False,
+                )
+            except Exception as e:
+                logger.warn(
+                    f"【123多盘】复用已保存登录态失败（{self._passport}），"
+                    f"将重新登录: {e}"
+                )
+        # 无已保存 token：构造即登录（sign_in），登录后持久化
+        client = P123Client(
+            self._passport, self._password, check_for_relogin=False
+        )
+        self._save_token(client)
+        return client
+
+    def _ensure_client(self) -> P123Client:
+        """线程安全地获取底层客户端（同一账号全局唯一实例）"""
+        if self._client is not None:
+            return self._client
+        with self._lock:
+            if self._client is None:
+                self._client = self._create_client()
+            return self._client
+
+    def _save_token(self, client) -> None:
+        """把客户端当前 token 持久化（登录后调用，供下次复用）"""
+        if not self._token_store:
+            return
+        try:
+            token = getattr(client, "token", "") or ""
+            if token:
+                self._token_store.set(self._passport, token)
+        except Exception as e:
+            logger.warn(f"【123多盘】保存登录 token 失败: {e}")
+
+    def _relogin(self, force: bool = False) -> bool:
+        """
+        强制重新登录（带锁，并发调用共享同一次登录）
+
+        :param force: 显式重登（如分享票 5112 自愈）不受冷却限制；
+                      自动重登（401 自愈）有冷却，避免短时间重复登录
+        :return: 是否已取得新 token
+        """
+        with self._lock:
+            now = time.time()
+            if (
+                not force
+                and self._last_relogin
+                and now - self._last_relogin < _RELOGIN_COOLDOWN
+            ):
+                # 冷却期内：不重复登录，用现有客户端重试
+                return self._client is not None
+            try:
+                client = P123Client(
+                    self._passport, self._password, check_for_relogin=False
+                )
+            except Exception as e:
+                logger.error(f"【123多盘】重新登录失败（{self._passport}）: {e}")
+                return False
+            self._client = client
+            self._last_relogin = now
+            self._save_token(client)
+            logger.info(f"【123多盘】账号 {self._passport} 已重新登录")
+            return True
+
+    # ==================== 代理调用 ====================
+
     def __getattr__(self, name):
-        if self._client is None:
-            self._client = P123Client(self._passport, self._password)
+        # 先解析底层属性：非可调用（如 token）直接返回值，
+        # 可调用（方法）返回代理 wrapped（含 401 自愈/重试逻辑）
+        client = self._ensure_client()
+        attr = getattr(client, name)
+        if not callable(attr):
+            return attr
 
         def wrapped(*args, **kwargs):
             """
-            代理调用 P123Client 的方法，自动处理 Token 超限重连
+            代理调用 P123Client 的方法，自动处理登录态：
 
-            :param args: 传递给客户端方法的位置参数
-            :param kwargs: 传递给客户端方法的关键字参数
-            :return: 客户端方法的返回值
+            - 401「tokens number has exceeded the limit」：token 数量超限，
+              不重登（重登只会产生更多 token），记录日志后原样返回
+            - 其他 401 / 认证异常：token 已失效，合并式重登（带冷却）后重试一次
             """
-            attr = getattr(self._client, name)
+            client = self._ensure_client()
+            attr = getattr(client, name)
             if not callable(attr):
                 return attr
-            result = attr(*args, **kwargs)
-            if (
-                isinstance(result, dict)
-                and result.get("code") == 401
-                and result.get("message") == "tokens number has exceeded the limit"
-            ):
-                self._client = P123Client(self._passport, self._password)
-                attr = getattr(self._client, name)
-                if not callable(attr):
-                    return attr
-                return attr(*args, **kwargs)
+            try:
+                result = attr(*args, **kwargs)
+            except P123AuthenticationError:
+                # 登录态失效（异常路径）：重登一次后重试，失败则抛出原异常
+                if self._relogin():
+                    client = self._ensure_client()
+                    attr = getattr(client, name)
+                    if callable(attr):
+                        return attr(*args, **kwargs)
+                raise
+            if isinstance(result, dict) and result.get("code") == 401:
+                msg = str(result.get("message") or "")
+                if "exceeded the limit" in msg:
+                    logger.warn(
+                        f"【123多盘】token 数量已达上限（{self._passport}），"
+                        "不再重复登录，请到 123 网盘「设备管理」清理无效登录设备"
+                    )
+                    return result
+                # token 失效（dict 路径）：合并式重登一次后重试
+                if self._relogin():
+                    client = self._ensure_client()
+                    attr = getattr(client, name)
+                    if callable(attr):
+                        result = attr(*args, **kwargs)
             return result
 
         return wrapped
 
     def relogin(self) -> str:
-        """强制重新登录：重建客户端重新 sign_in，返回新 token
+        """强制重新登录（不受冷却限制），返回新 token
 
         分享票换票被连续 5112 拒绝（token 被服务端作废）时调用；
-        P123Client 构造即登录（passport+password），失败会抛异常由调用方处理。
+        登录失败时返回旧/空 token（错误已记日志），由调用方判断。
         """
-        self._client = P123Client(self._passport, self._password)
-        return getattr(self._client, "token", "") or ""
+        self._relogin(force=True)
+        client = self._ensure_client()
+        return getattr(client, "token", "") or ""
 
     def set_download_base_urls(self, base_urls: Optional[Iterable[str]] = None):
         """自定义换链域名候选（按优先级排序；空则恢复内置默认）"""
