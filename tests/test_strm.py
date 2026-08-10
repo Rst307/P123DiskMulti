@@ -441,7 +441,7 @@ check(dl is None, "分享票模式无分享记录返回 None")
 check(len(probe_queue) == 1, "未走 VIP 通道")
 tool_mod.probe_download_url = _orig_probe2
 
-# 9.4 自动模式：无分享记录 → 回退 VIP 直链
+# 9.4 自动模式：按需定位失败（文件不存在）→ 回退 VIP 直链
 dl = helper8.resolve_download_url("别的.mkv", 100, "md5-none", "s3x", disk_name="盘E")
 check(dl == "http://download/1", "auto 模式无分享记录回退 VIP 直链")
 
@@ -653,7 +653,7 @@ check(
     "分享内已移除的文件索引被清理",
 )
 
-# 10.7 独立服务：未配置分享增量同步时播放回退 VIP（auto 模式）
+# 10.7 auto 模式：按需定位失败（文件不存在）→ 回退 VIP 直链
 helper11 = StrmHelper(
     api=api5, moviepilot_address="http://127.0.0.1:3000",
     ticket_mode="auto", shares=[], self_share=ssm,
@@ -798,8 +798,7 @@ check(dl == "http://edge.example/file", "根目录存在同名文件时播放成
 check(len(fake_g.entries) == entries_before, "播放后网盘条目数不变（不重复复制）")
 check(len(fake_g.upload_request_calls) == 0, "同名场景同样不调用秒传")
 
-# 11.7 auto 模式三级兜底：分享记录失效（分享内找不到路径）+ VIP 风控
-#     -> 按需分享定位原文件兜底播放（用户当前场景：分享 完美世界 内未找到路径）
+# 11.7 auto 模式按需优先：直接按需分享播放成功，不触发 VIP 通道（探测未消费）
 stale_task = ShareSync(
     api=api6,
     task_id="ST1",
@@ -823,7 +822,7 @@ _orig_probe3 = tool_mod.probe_download_url
 probe_queue = [
     (False, 403, "message=download err: 50002 code=1010"),
     (False, 403, "message=download err: 50002 code=1010"),
-]  # VIP 两个候选域名均被风控
+]  # VIP 两个候选域名均被风控（按需优先时不应被消费）
 
 
 def _fake_probe3(url, headers=None, timeout=8):
@@ -835,14 +834,14 @@ fake_g.share_create_calls.clear()
 entries_before = len(fake_g.entries)
 dl = helper14.resolve_download_url("MOV.A.mkv", 999, "md5-ond", "s3", disk_name="盘G")
 tool_mod.probe_download_url = _orig_probe3
-check(dl == "http://edge.example/file", "分享失效+VIP风控时按需分享兜底播放成功")
-check(len(probe_queue) == 0, f"VIP 通道确实被尝试（探测已消费）: {len(probe_queue)}")
+check(dl == "http://edge.example/file", "auto 模式按需分享优先播放成功")
+check(len(probe_queue) == 2, f"按需成功未触发 VIP 探测（探测未消费）: {len(probe_queue)}")
 check(
     fake_g.share_create_calls
     and fake_g.share_create_calls[0]["payload"]["fileIdList"] == str(loc_id),
-    "兜底分享指向网盘原文件",
+    "按需分享指向网盘原文件",
 )
-check(len(fake_g.entries) == entries_before, "兜底播放后网盘条目数不变")
+check(len(fake_g.entries) == entries_before, "按需播放后网盘条目数不变")
 
 # 11.8 建分享接口失败：返回 None（先清缓存确保走到建分享路径）
 helper12._on_demand_share_cache.take(key_od)

@@ -46,7 +46,7 @@ class P123DiskMulti(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/DDSRem-Dev/MoviePilot-Plugins/main/icons/P123Disk.png"
     # 插件版本
-    plugin_version = "1.4.11"
+    plugin_version = "1.4.10"
     # 插件作者
     plugin_author = "Rst307"
     # 作者主页
@@ -135,7 +135,7 @@ class P123DiskMulti(_PluginBase):
             except (TypeError, ValueError):
                 self._download_cache_ttl = 600
 
-            # 播放票模式（vip=VIP直链 | share=分享票 | auto=分享票优先+VIP兜底）
+            # 播放票模式（vip=VIP直链 | share=分享票 | auto=按需分享优先+VIP兜底）
             self._ticket_mode = str(config.get("ticket_mode") or "vip").strip().lower()
             if self._ticket_mode not in ("vip", "share", "auto", "on_demand"):
                 self._ticket_mode = "vip"
@@ -1159,7 +1159,7 @@ class P123DiskMulti(_PluginBase):
                                                     "value": "share",
                                                 },
                                                 {
-                                                    "title": "自动（分享票优先，失败回退 VIP）",
+                                                    "title": "自动（按需分享优先，失败回退 VIP）",
                                                     "value": "auto",
                                                 },
                                                 {
@@ -1167,7 +1167,7 @@ class P123DiskMulti(_PluginBase):
                                                     "value": "on_demand",
                                                 },
                                             ],
-                                            "hint": "VIP 直链：账号直链换链，带域名风控自动切换；分享票：通过已有分享下载票播放（来源必须是「自分享目录服务」的目录或「分享增量同步」转存入库的文件）；按需分享：播放时自动为文件创建带有效期的单文件分享（任何自己上传/转存的文件均可，免建目录分享/免索引）；自动：分享票优先、失败自动回退 VIP",
+                                            "hint": "VIP 直链：账号直链换链，带域名风控自动切换；分享票：通过已有分享下载票播放（来源必须是「自分享目录服务」的目录或「分享增量同步」转存入库的文件）；按需分享：播放时自动为文件创建带有效期的单文件分享（任何自己上传/转存的文件均可，免建目录分享/免索引）；自动：按需分享优先、失败自动回退 VIP",
                                             "persistent-hint": True,
                                         },
                                     }
@@ -1475,7 +1475,7 @@ class P123DiskMulti(_PluginBase):
                                             {
                                                 "component": "div",
                                                 "props": {"class": "text-caption"},
-                                                "text": "• 播放票类型选择「分享票」或「自动」后，自己上传/转存的媒体文件都可走分享票播放，多 IP 拉流不再触发账号风控",
+                                                "text": "• 播放票类型选择「分享票」走分享票播放（多 IP 拉流不再触发账号风控）；选择「自动」按需分享优先（任何自己上传/转存的文件均可直接播放），失败自动回退 VIP 直链",
                                             },
                                             {
                                                 "component": "div",
@@ -1945,7 +1945,7 @@ class P123DiskMulti(_PluginBase):
                             if self._download_cache_ttl > 0
                             else "，直链缓存关闭"
                         )
-                        + f"，播放票: {'VIP直链' if self._ticket_mode == 'vip' else '分享票' if self._ticket_mode == 'share' else '按需分享' if self._ticket_mode == 'on_demand' else '自动(分享票优先)'}"
+                        + f"，播放票: {'VIP直链' if self._ticket_mode == 'vip' else '分享票' if self._ticket_mode == 'share' else '按需分享' if self._ticket_mode == 'on_demand' else '自动(按需分享优先)'}"
                     ),
                 }
             )
