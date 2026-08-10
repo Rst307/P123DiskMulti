@@ -172,9 +172,23 @@ check(helper.handle_transfer_complete(item_sub, "/盘A/电影", mappings_text) i
 # 5.4 路径不匹配跳过
 item_out = make_target_item("/盘A/纪录片/E02.mkv", "E02.mkv", 10, "m3", "s3")
 check(helper.handle_transfer_complete(item_out, "/盘A/纪录片", mappings_text) is None, "未匹配输出目录跳过")
-# 5.5 pickcode 缺失跳过
+# 5.5 整理事件偶尔不带 pickcode，但目标文件已在网盘，应回查完整信息
+item_event_no_pickcode = FileItem(
+    storage="123云盘",
+    path="/盘A/电影/阿凡达.mkv",
+    name="阿凡达.mkv",
+    type="file",
+)
+recovered = helper.handle_transfer_complete(
+    item_event_no_pickcode, "/盘A/电影", mappings_text
+)
+check(
+    recovered is not None and recovered.name == "阿凡达.strm",
+    "整理事件缺少 pickcode 时按目标路径回查网盘信息并生成 STRM",
+)
+# 目标路径不存在时仍应安全跳过
 item_noinfo = FileItem(storage="123云盘", path="/盘A/电影/x.mkv", name="x.mkv", type="file")
-check(helper.handle_transfer_complete(item_noinfo, "/盘A/电影", mappings_text) is None, "缺少文件信息跳过")
+check(helper.handle_transfer_complete(item_noinfo, "/盘A/电影", mappings_text) is None, "网盘中找不到文件时安全跳过")
 
 # ============ 6. 后台异步全量同步 ============
 print("== 6. 后台异步全量同步 ==")

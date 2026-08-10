@@ -46,7 +46,7 @@ class P123DiskMulti(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/DDSRem-Dev/MoviePilot-Plugins/main/icons/P123Disk.png"
     # 插件版本
-    plugin_version = "1.4.14"
+    plugin_version = "1.4.15"
     # 插件作者
     plugin_author = "Rst307"
     # 作者主页

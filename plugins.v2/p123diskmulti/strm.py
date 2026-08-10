@@ -610,7 +610,7 @@ class StrmHelper:
         """
         处理 MoviePilot 转移完成事件，为入库文件生成 STRM
 
-        :param target_item: 转移后的目标文件项（须含 pickcode）
+        :param target_item: 转移后的目标文件项（缺少 pickcode 时按路径补查）
         :param target_diritem_path: 转移目标目录路径
         :param paths_text: 路径映射配置（本地STRM目录#网盘媒体库目录）
         :return: 生成的 STRM 文件路径，未生成返回 None
@@ -620,25 +620,28 @@ class StrmHelper:
         # 仅处理媒体文件
         if not self.is_media_file(target_item.name or ""):
             return None
-        info = self._extract_file_info(target_item)
-        if not info:
-            logger.warn(
-                f"【123多盘STRM】{target_item.path} 缺少网盘文件信息，无法生成 STRM"
-            )
-            return None
         # 蓝光原盘不支持 STRM
         if self._is_bluray_dir(target_diritem_path):
             logger.warning(
                 f"【123多盘STRM】{target_item.path} 为蓝光原盘目录，跳过"
             )
             return None
-        # 匹配本地目录映射
+        # 先匹配路径，未配置监控的目录不必向网盘发起补查请求
         local_dir, pan_dir = self.match_media_path(
             target_item.path, self.parse_mappings(paths_text)
         )
         if not local_dir:
             logger.debug(
                 f"【123多盘STRM】{target_item.path} 未匹配到 STRM 输出目录，跳过"
+            )
+            return None
+        # 整理完成事件偶尔只带基础 FileItem，按目标路径回查 123 原始文件信息
+        info = self._extract_file_info(target_item)
+        if not info:
+            info = self._lookup_file_info(target_item)
+        if not info:
+            logger.warn(
+                f"【123多盘STRM】{target_item.path} 缺少网盘文件信息，无法生成 STRM"
             )
             return None
         rel_path = self._relative_path(target_item.path, pan_dir)
@@ -720,6 +723,24 @@ class StrmHelper:
         if best:
             return best
         return None, None
+
+    def _lookup_file_info(self, fileitem: FileItem) -> Optional[Dict]:
+        """整理事件缺少 pickcode 时，按已落盘路径回查 123 文件详情"""
+        if not self._api or not fileitem or not fileitem.path:
+            return None
+        try:
+            refreshed = self._api.get_item(Path(str(fileitem.path)))
+            info = self._extract_file_info(refreshed)
+            if info:
+                logger.debug(
+                    f"【123多盘STRM】整理事件文件信息不完整，已按路径补齐: {fileitem.path}"
+                )
+            return info
+        except Exception as e:
+            logger.debug(
+                f"【123多盘STRM】按路径补查文件信息失败 {fileitem.path}: {e}"
+            )
+            return None
 
     # ==================== 文件工具 ====================
 
