@@ -207,6 +207,7 @@ class FakeP123Client:
         self.fs_list_new_calls = []
         self.search_off = False  # True 时全局搜索返回空（模拟搜索未命中）
         self.fail_search_401 = False  # True 时全局搜索抛 401 认证异常（模拟登录态失效）
+        self.fs_list_sleep = 0.0  # fs_list 每次调用延时秒数（限时定位测试用）
         self.relogin_calls = 0  # 强制重登次数（换票 5112 自愈用）
 
     def relogin(self):
@@ -244,10 +245,35 @@ class FakeP123Client:
 
     # ---- 文件操作 ----
     def fs_list(self, payload):
+        """模拟 file/list：与真实 123 API 一致——只按 next 游标分页，
+        Page 参数被忽略（next=0 永远返回第一页）；Next 为下一页首项 FileId，
+        无更多时返回 -1。fs_list_sleep>0 时每次调用延时（模拟限时定位测试用）。"""
         parent = payload.get("parentFileId", 0)
         children = self._children(parent)
         children.sort(key=lambda e: e["FileName"])
-        return {"code": 0, "data": {"InfoList": children, "Next": "-1"}}
+        if getattr(self, "fs_list_sleep", 0):
+            import time as _t
+            _t.sleep(self.fs_list_sleep)
+        limit = max(1, int(payload.get("limit", 100)))
+        _next = int(payload.get("next", 0) or 0)
+        if _next == 0:
+            start = 0
+        else:
+            start = next(
+                (i for i, e in enumerate(children) if int(e["FileId"]) >= _next),
+                len(children),
+            )
+        chunk = children[start:start + limit]
+        end = start + len(chunk)
+        if end >= len(children):
+            return {"code": 0, "data": {"InfoList": [dict(e) for e in chunk], "Next": "-1"}}
+        return {
+            "code": 0,
+            "data": {
+                "InfoList": [dict(e) for e in chunk],
+                "Next": str(children[end]["FileId"]),
+            },
+        }
 
     def fs_list_new(self, payload, base_url="", event="homeListFile", **kwargs):
         """模拟 web 文件列表（file/list/new）：SearchData 时全局按名模糊搜索"""

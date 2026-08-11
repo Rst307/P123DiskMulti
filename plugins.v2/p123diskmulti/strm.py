@@ -29,6 +29,7 @@ from app.log import logger
 from app.schemas import FileItem
 
 from .share_ticket import (
+    ON_DEMAND_LOCATE_TIMEOUT,
     OnDemandShareCache,
     ShareTicketCache,
     get_on_demand_share_url,
@@ -219,6 +220,12 @@ class StrmHelper:
                     user_agent=user_agent or DEFAULT_UA,
                     ticket_cache=self._share_ticket_cache,
                     share_cache=self._on_demand_share_cache,
+                    # auto 模式限时定位：超时回退 VIP 直链 + 后台预建分享
+                    locate_timeout=(
+                        ON_DEMAND_LOCATE_TIMEOUT
+                        if self._ticket_mode == "auto"
+                        else 0.0
+                    ),
                 )
                 if url:
                     return url

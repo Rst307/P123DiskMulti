@@ -65,7 +65,7 @@ python -c "import ast; ast.parse(open('plugins.v2/p123diskmulti/tool.py', encodi
 - 换票始终以客户端**当前**登录态为准，禁止入口处捕获旧 token 后跨重登使用
 - 5112 时依次尝试 open_platform / android 平台模板，均失败才 `_force_relogin` 重试一次
 - 认证头必须用小写 `authorization` 键（大写 Authorization 会覆盖 p123client 自带头，导致 401）
-- 按需分享（on_demand）：定位用 `file/list/new` 搜索 + `fs_list` 遍历兜底，**禁止用 upload_request 秒传定位**（会在根目录生成重复文件）
+- 按需分享（on_demand）：定位用 `file/list/new` 搜索 + `fs_list` 遍历兜底，**禁止用 upload_request 秒传定位**（会在根目录生成重复文件）；**`fs_list` 遍历分页必须用 `next` 游标**（123 服务端忽略 `Page` 参数，next 固定 0 会永远重复第一页，目录超 100 项即定位不到）
 
 ## 版本发布约定
 

@@ -26,7 +26,7 @@ import base64
 import threading
 import time
 from datetime import datetime, timedelta
-from typing import Dict, Optional, Tuple
+from typing import Dict, Optional, Set, Tuple
 from urllib.parse import parse_qs, urlsplit
 
 import requests
@@ -480,6 +480,11 @@ _MAX_SEARCH_PAGES = 5
 # 遍历兜底上限（防超大网盘拖垮首次播放）：超过即放弃并提示用户
 _MAX_WALK_DIRS = 500
 _MAX_WALK_ITEMS = 20000
+# auto 模式按需定位时间预算（秒）：超过立即回退 VIP 直链，后台继续定位并预建分享
+ON_DEMAND_LOCATE_TIMEOUT = 8.0
+# 后台预建分享 in-flight 去重（并发播放 HEAD+GET 同时超时时只预建一次）
+_WARM_LOCK = threading.Lock()
+_WARM_INFLIGHT: Set[tuple] = set()
 
 
 def on_demand_expire_iso(days: int) -> str:
@@ -534,6 +539,7 @@ def _search_file(
     size,
     user_agent: str = "",
     base_url: str = ON_DEMAND_API_BASE,
+    deadline: Optional[float] = None,
 ):
     """全局搜索定位：GET file/list/new（SearchData 按文件名搜索，跨整个网盘）
 
@@ -542,7 +548,7 @@ def _search_file(
     不会在网盘创建任何副本。
     返回 (located, rejected)：命中时 located 为 (file_id, s3_key_flag) 元组，
     否则为 None；rejected 表示请求被接口拒绝（401 登录态失效），调用方据此
-    区分「未命中」与「被拒绝」。
+    区分「未命中」与「被拒绝」。deadline 非空时超时立即放弃（返回未命中）。
     """
     keyword = str(name or "").strip()
     if not keyword:
@@ -552,6 +558,8 @@ def _search_file(
         stem = keyword.rsplit(".", 1)[0] if "." in keyword else keyword
         keyword = stem[:128]
     for page in range(1, _MAX_SEARCH_PAGES + 1):
+        if deadline is not None and time.time() >= deadline:
+            return None, False
         try:
             resp = client.fs_list_new(
                 {
@@ -596,11 +604,16 @@ def _search_file(
     return None, False
 
 
-def _walk_find_file(client, md5: str, size):
+def _walk_find_file(client, md5: str, size, deadline: Optional[float] = None):
     """遍历兜底定位：BFS 递归 fs_list，按 etag+size 精确匹配原文件
 
     仅当全局搜索未命中时使用（如文件已被改名，搜索不到）；纯查询，
     不创建任何副本。带目录/条目上限防止超大网盘拖垮首次播放。
+    deadline 非空时超时立即返回 None（不抛异常），供 auto 模式限时定位。
+
+    ⚠️ 分页必须用 next 游标（服务端实测忽略 Page 参数，传 next=0 永远返回
+    第一页）：旧实现 Page 递增 + next 固定 0，目录条目超过 100 时永远
+    看不到第 2 页，遍历兜底形同虚设（复现：雷神3 定位失败）。
     """
     size = int(size or 0)
     visited = set()
@@ -608,17 +621,22 @@ def _walk_find_file(client, md5: str, size):
     dirs_seen = 0
     items_seen = 0
     while queue:
+        if deadline is not None and time.time() >= deadline:
+            return None
         parent = queue.pop(0)
         if str(parent) in visited:
             continue
         visited.add(str(parent))
         page = 1
+        _next = 0
         while True:
+            if deadline is not None and time.time() >= deadline:
+                return None
             try:
                 resp = client.fs_list(
                     {
                         "limit": 100,
-                        "next": 0,
+                        "next": _next,
                         "Page": page,
                         "parentFileId": int(parent),
                         "inDirectSpace": "false",
@@ -659,6 +677,7 @@ def _walk_find_file(client, md5: str, size):
                 return int(file_id), str(it.get("S3KeyFlag") or "")
             if len(items) < 100 or str(data.get("Next") or "") == "-1":
                 break
+            _next = data.get("Next")
             page += 1
         dirs_seen += 1
         if dirs_seen > _MAX_WALK_DIRS:
@@ -677,15 +696,22 @@ def _locate_file(
     size=0,
     user_agent: str = "",
     base_url: str = ON_DEMAND_API_BASE,
+    deadline: Optional[float] = None,
 ):
     """定位网盘内原文件：优先全局搜索，未命中再递归遍历兜底
 
     两者均为纯查询（不调用秒传、不创建任何副本），返回原文件
-    (file_id, s3_key_flag)；找不到返回 None。
+    (file_id, s3_key_flag)；找不到返回 (None, timed_out)。
+    deadline 非空时超时立即放弃：timed_out=True 表示因限时放弃
+    （auto 模式据此回退 VIP 并后台预建分享），False 表示真正未找到。
     """
-    located, rejected = _search_file(client, name, md5, size, user_agent, base_url)
+    located, rejected = _search_file(
+        client, name, md5, size, user_agent, base_url, deadline=deadline
+    )
     if located:
-        return located
+        return located, False
+    if deadline is not None and time.time() >= deadline:
+        return None, True
     if rejected:
         logger.warn(
             f"【123多盘】按需分享全局搜索被拒绝（401 登录态失效），直接遍历网盘定位"
@@ -695,7 +721,9 @@ def _locate_file(
         logger.warn(
             f"【123多盘】按需分享全局搜索未命中（{name or md5}），改为遍历网盘定位（仅按需，可能较慢）"
         )
-    return _walk_find_file(client, md5, size)
+    return _walk_find_file(client, md5, size, deadline=deadline), (
+        deadline is not None and time.time() >= deadline
+    )
 
 
 def _create_share(
@@ -755,6 +783,80 @@ def _cancel_share(client, share_id, base_url: str = ON_DEMAND_API_BASE):
         logger.debug(f"【123多盘】按需分享清理旧分享失败（忽略）: {e}")
 
 
+def _warm_share_async(
+    account,
+    disk_name: str,
+    name: str,
+    md5: str,
+    size,
+    ttl_days: int,
+    share_pwd: str,
+    user_agent: str,
+    ticket_cache,
+    share_cache,
+    key: tuple,
+):
+    """后台预建按需分享：定位原文件 + 建分享 + 写缓存（幂等）
+
+    auto 模式定位超时后调用：本次播放先走 VIP 直链，后台把分享建好写入
+    缓存，下次播放直接命中（秒开）。in-flight 去重保证并发播放
+    （Emby HEAD+GET 同时超时）只预建一次。
+    """
+    with _WARM_LOCK:
+        if key in _WARM_INFLIGHT:
+            return
+        if share_cache:
+            rec = share_cache.take(key)
+            if rec and rec.get("expired_at", 0) > time.time():
+                share_cache.set(key, rec)  # 其他线程已建好
+                return
+            if rec:  # 已过期：后台线程负责重建（旧分享到期自清理）
+                _cancel_share(account.client, rec.get("share_id"))
+        _WARM_INFLIGHT.add(key)
+
+    def _run():
+        try:
+            located, _ = _locate_file(
+                account.client,
+                disk_name=disk_name,
+                name=name,
+                md5=md5,
+                size=size,
+                user_agent=user_agent,
+            )
+            if not located:
+                logger.warn(
+                    f"【123多盘】后台预建分享定位失败（{name}），放弃预建"
+                )
+                return
+            file_id, s3_flag = located
+            share = _create_share(account.client, file_id, name, ttl_days, share_pwd)
+            if not share:
+                return
+            rec = {
+                "share_id": share["share_id"],
+                "share_key": share["share_key"],
+                "share_pwd": share["share_pwd"],
+                "file_id": file_id,
+                "s3_key_flag": s3_flag,
+                "expired_at": time.time() + max(1, int(ttl_days)) * 86400,
+            }
+            if share_cache:
+                share_cache.set(key, rec)
+            logger.info(
+                f"【123多盘】后台已为 {name} 预建分享（有效期 {ttl_days} 天，下次播放秒开）"
+            )
+        except Exception as e:
+            logger.warn(f"【123多盘】后台预建分享失败（{name}）: {e}")
+        finally:
+            with _WARM_LOCK:
+                _WARM_INFLIGHT.discard(key)
+
+    threading.Thread(
+        target=_run, daemon=True, name="p123-ondemand-warm"
+    ).start()
+
+
 def get_on_demand_share_url(
     account,
     disk_name: str,
@@ -767,6 +869,7 @@ def get_on_demand_share_url(
     ticket_cache: Optional[ShareTicketCache] = None,
     share_cache: Optional[OnDemandShareCache] = None,
     timeout: float = 8,
+    locate_timeout: float = 0.0,
 ) -> Optional[str]:
     """按需分享票完整链路（懒建分享）
 
@@ -774,6 +877,9 @@ def get_on_demand_share_url(
     2. 分享已过期 -> 先取消旧分享（到期自清理），再建新分享
     3. 换票/解析失败（分享被风控或失效）-> 取消旧分享重建，重试一次
     4. 定位/建分享/换票失败均返回 None，日志明确原因
+    5. locate_timeout>0 时限时定位（auto 模式）：超时立即返回 None（由调用方
+       回退 VIP 直链，避免大网盘遍历拖垮首次播放），同时后台继续定位并预建
+       分享，下次播放命中缓存秒开
     :return: 可直接 302 给 Emby 的最终边缘 URL；失败 None
     """
     if not md5 or not size:
@@ -818,15 +924,41 @@ def get_on_demand_share_url(
             _cancel_share(account.client, rec.get("share_id"))
             rec = None
     # 建新分享（定位原文件：全局搜索优先、遍历兜底，纯查询不创建副本）
-    located = _locate_file(
+    deadline = (
+        time.time() + float(locate_timeout)
+        if locate_timeout and float(locate_timeout) > 0
+        else None
+    )
+    located, timed_out = _locate_file(
         account.client,
         disk_name=disk_name,
         name=name,
         md5=md5,
         size=size,
         user_agent=user_agent,
+        deadline=deadline,
     )
     if not located:
+        if timed_out:
+            # 限时未命中：本次回退 VIP 直链，后台继续定位并预建分享（下次秒开）
+            logger.warn(
+                f"【123多盘】按需分享定位超过 {float(locate_timeout):.1f}s 未命中（{name}），"
+                "本次回退 VIP 直链，已后台继续定位并预建分享（下次播放秒开）"
+            )
+            _warm_share_async(
+                account,
+                disk_name=disk_name,
+                name=name,
+                md5=md5,
+                size=size,
+                ttl_days=ttl_days,
+                share_pwd=share_pwd,
+                user_agent=user_agent,
+                ticket_cache=ticket_cache,
+                share_cache=share_cache,
+                key=key,
+            )
+            return None
         logger.error(
             f"【123多盘】按需分享定位文件失败（{name}，md5={md5}，size={size}）："
             "已尝试全局搜索与遍历，网盘中未找到原文件，请确认 STRM 与网盘数据一致"

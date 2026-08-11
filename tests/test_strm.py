@@ -997,5 +997,62 @@ check(
     f"重登前用旧 token、重登后用新 token: {ond_auths}",
 )
 
+# 11.15 回归：目录条目超过 100 时遍历兜底按 next 游标翻页定位
+#     真实 123 API 的 file/list 只认 next 游标、忽略 Page 参数；旧实现
+#     next 固定 0 + Page 递增，永远重复第一页，深目录文件定位失败
+#     （雷神3：诸神黄昏.2017…Atmos.mkv 即因此无法按需播放）
+big_dir = fake_g._entry("BIG", 0, "dir")
+for i in range(150):
+    fake_g._entry(f"a{i:03d}.mkv", big_dir["FileId"], "file", size=100 + i, etag=f"e-{i}")
+deep_ent = fake_g._entry("zDEEP.mkv", big_dir["FileId"], "file", size=777, etag="md5-deep")
+fake_g.search_off = True
+fake_g.share_create_calls.clear()
+helper12._on_demand_share_cache.take(("盘G", "md5-deep", 777))
+dl = helper12.resolve_download_url("zDEEP.mkv", 777, "md5-deep", "", disk_name="盘G")
+fake_g.search_off = False
+check(dl == "http://edge.example/file", "超过 100 项的目录遍历兜底按游标翻页定位成功")
+check(
+    fake_g.share_create_calls
+    and fake_g.share_create_calls[0]["payload"]["fileIdList"] == str(deep_ent["FileId"]),
+    f"遍历兜底定位到第 2 页的原文件（fileId={deep_ent['FileId']}）",
+)
+check(len(fake_g.upload_request_calls) == 0, "游标翻页定位同样不调用秒传")
+
+# 11.16 auto 模式定位超时：立即返回 None（交由调用方回退 VIP 直链），
+#     后台继续定位并预建分享，下次播放命中缓存秒开
+#     —— 解决「按需定位未命中时遍历整盘几十秒，Emby 客户端等不到 302」
+fake_g.fs_list_sleep = 0.05  # 每次 fs_list 延时（两次调用即超限时预算，保证超时）
+fake_g.search_off = True
+fake_g.share_create_calls.clear()
+helper12._on_demand_share_cache.take(("盘G", "md5-deep", 777))
+dl = get_on_demand_share_url(
+    acc_g, "盘G", "zDEEP.mkv", "md5-deep", 777,
+    ttl_days=7, share_pwd="",
+    ticket_cache=helper12._share_ticket_cache,
+    share_cache=helper12._on_demand_share_cache,
+    timeout=8,
+    locate_timeout=0.05,
+)
+fake_g.fs_list_sleep = 0.0
+check(dl is None, "定位超过限时预算立即返回 None（回退 VIP 直链，不再拖几十秒）")
+warm_rec = None
+_poll_end = time.time() + 5
+while time.time() < _poll_end:
+    warm_rec = helper12._on_demand_share_cache.take(("盘G", "md5-deep", 777))
+    if warm_rec:
+        break
+    time.sleep(0.05)
+fake_g.search_off = False
+check(
+    warm_rec and str(warm_rec.get("file_id")) == str(deep_ent["FileId"]),
+    f"后台预建分享完成并写入缓存（下次播放秒开）: {warm_rec}",
+)
+check(
+    fake_g.share_create_calls
+    and fake_g.share_create_calls[0]["payload"]["fileIdList"] == str(deep_ent["FileId"]),
+    "后台预建分享指向网盘原文件",
+)
+check(len(fake_g.upload_request_calls) == 0, "后台预建同样不调用秒传")
+
 print(f"\n结果: {passed} 通过, {failed} 失败")
 sys.exit(1 if failed else 0)
