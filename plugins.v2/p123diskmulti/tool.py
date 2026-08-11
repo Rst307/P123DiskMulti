@@ -517,7 +517,9 @@ class P123AutoClient:
                 if "exceeded the limit" in msg:
                     logger.warn(
                         f"【123多盘】token 数量已达上限（{self._passport}），"
-                        "不再重复登录，请到 123 网盘「设备管理」清理无效登录设备"
+                        "不再重复登录：请到 123 网盘「设备管理」清理无效登录设备；"
+                        "若设备数正常，说明本 token 已被新登录挤出，可在插件页点"
+                        "「强制重新登录」自愈"
                     )
                     return result
                 # token 失效（dict 路径）：合并式重登一次后重试

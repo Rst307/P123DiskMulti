@@ -1900,7 +1900,8 @@ class P123MultiApi:
                 data = resp.get("data") or {}
                 if isinstance(data, dict):
                     items = (
-                        data.get("list")
+                        data.get("DeviceS")
+                        or data.get("list")
                         or data.get("List")
                         or data.get("infoList")
                         or data.get("InfoList")
@@ -1922,12 +1923,14 @@ class P123MultiApi:
                                 it.get("DeviceName")
                                 or it.get("deviceName")
                                 or it.get("name")
+                                or it.get("device_name")
                                 or "未知设备"
                             ),
                             "id": str(
                                 it.get("DeviceId")
                                 or it.get("deviceId")
                                 or it.get("id")
+                                or it.get("key")
                                 or ""
                             ),
                             "time": str(
@@ -1936,6 +1939,7 @@ class P123MultiApi:
                                 or it.get("LoginAt")
                                 or it.get("lastLoginTime")
                                 or it.get("UpdatedAt")
+                                or it.get("last_login_time")
                                 or ""
                             ),
                             "status": str(
@@ -1946,6 +1950,8 @@ class P123MultiApi:
                                 or it.get("platform")
                                 or it.get("DeviceType")
                                 or it.get("deviceType")
+                                or it.get("device_type")
+                                or it.get("plat_form")
                                 or ""
                             ),
                         }
@@ -1967,6 +1973,44 @@ class P123MultiApi:
                         "devices": [],
                         "message": f"获取设备列表失败: {e}",
                     }
+                )
+        return results
+
+    def relogin_all(self) -> List[Dict]:
+        """
+        强制重新登录所有网盘账号（不受冷却限制）
+
+        用于 token 被 123 服务端作废/挤出后的自愈：123 在登录设备（token）
+        数量超过上限时会把最早登录的 token 作废并返回「tokens number has
+        exceeded the limit」，而插件对超限 401 默认不重登（防登录风暴），
+        此时 token 已死的账号会卡死；这里显式以密码重新登录并持久化新
+        token，旧 token 立即作废。
+
+        :return: [{name, ok, message}]
+        """
+        results = []
+        for acc in self._accounts:
+            try:
+                token = acc.client.relogin()
+                if token:
+                    results.append(
+                        {
+                            "name": acc.name,
+                            "ok": True,
+                            "message": "重新登录成功（新 token 已持久化）",
+                        }
+                    )
+                else:
+                    results.append(
+                        {
+                            "name": acc.name,
+                            "ok": False,
+                            "message": "重新登录失败（详见插件日志）",
+                        }
+                    )
+            except Exception as e:
+                results.append(
+                    {"name": acc.name, "ok": False, "message": f"重新登录失败: {e}"}
                 )
         return results
 

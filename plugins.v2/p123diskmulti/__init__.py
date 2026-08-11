@@ -46,7 +46,7 @@ class P123DiskMulti(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/DDSRem-Dev/MoviePilot-Plugins/main/icons/P123Disk.png"
     # 插件版本
-    plugin_version = "1.4.17"
+    plugin_version = "1.4.18"
     # 插件作者
     plugin_author = "Rst307"
     # 作者主页
@@ -698,6 +698,14 @@ class P123DiskMulti(_PluginBase):
                 "methods": ["GET"],
                 "summary": "查看登录设备列表",
                 "description": "查看所有网盘账号的 123 登录设备记录（排查 token 数量超限）",
+            },
+            {
+                "path": "/relogin",
+                "endpoint": self.api_relogin,
+                "auth": "bear",
+                "methods": ["POST"],
+                "summary": "强制重新登录所有网盘账号",
+                "description": "token 被 123 作废/挤出后卡死时使用：以密码重新登录并持久化新 token（不受超限不重登守卫与冷却限制）",
             },
             {
                 "path": "/balance",
@@ -1779,6 +1787,22 @@ class P123DiskMulti(_PluginBase):
                             {
                                 "component": "VBtn",
                                 "props": {
+                                    "color": "error",
+                                    "variant": "tonal",
+                                    "size": "small",
+                                    "prepend-icon": "mdi-refresh",
+                                },
+                                "text": "强制重新登录",
+                                "events": {
+                                    "click": {
+                                        "api": "plugin/P123DiskMulti/relogin",
+                                        "method": "post",
+                                    },
+                                },
+                            },
+                            {
+                                "component": "VBtn",
+                                "props": {
                                     "color": "warning",
                                     "variant": "tonal",
                                     "size": "small",
@@ -2664,6 +2688,28 @@ class P123DiskMulti(_PluginBase):
             return {"success": all_ok, "message": message, "results": results}
         except Exception as e:
             return {"success": False, "message": f"获取设备列表失败: {e}"}
+
+    def api_relogin(self) -> Dict[str, Any]:
+        """
+        强制重新登录所有网盘账号（解决 token 失效/被挤出后卡死）
+        """
+        if not self._api:
+            return {"success": False, "message": "插件未启用或未配置网盘"}
+        try:
+            results = self._api.relogin_all()
+            lines = [
+                f"{'✓' if r.get('ok') else '✗'} {r['name']}: {r.get('message', '')}"
+                for r in results
+            ]
+            joined = "\n".join(lines)
+            logger.info(f"【123多盘】强制重新登录:\n{joined}")
+            return {
+                "success": all(r.get("ok") for r in results),
+                "message": "\n".join(lines),
+                "results": results,
+            }
+        except Exception as e:
+            return {"success": False, "message": f"强制重新登录失败: {e}"}
 
     def api_balance(self) -> Dict[str, Any]:
         """

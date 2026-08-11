@@ -211,9 +211,10 @@ class FakeP123Client:
         self.relogin_calls = 0  # 强制重登次数（换票 5112 自愈用）
 
     def relogin(self):
-        """模拟强制重登：换发新 token"""
+        """模拟强制重登：换发新 token（返回新 token）"""
         self.relogin_calls += 1
         self.token = f"fake-token-new{self.relogin_calls}"
+        return self.token
 
     def _new_id(self):
         self.next_id += 1
@@ -507,6 +508,9 @@ class FakeP123Client:
                     "Platform": "web",
                 }
             ]
+        if getattr(self, "device_list_shape", "") == "DeviceS":
+            # 真实 123 响应：data.DeviceS + 蛇形字段
+            return {"code": 0, "data": {"DeviceS": [dict(d) for d in devices]}}
         return {"code": 0, "data": {"list": [dict(d) for d in devices]}}
 
     def share_list(self, payload, base_url="", **kwargs):
@@ -1040,6 +1044,61 @@ def _run_tests():
     check(d0["count"] == 3, "多设备记录解析")
     check(d0["devices"][0]["platform"] == "", "缺失字段兜底为空")
     check(d0["devices"][2]["name"] == "未知设备", "未知字段设备显示未知设备")
+    # 真实 123 响应格式（data.DeviceS + 蛇形字段）：修复前解析不到任何设备
+    fake_dev_b = [
+        {
+            "device_name": "I7UgGU1tgfkRzWgVRwDzz3S5XUrWp5mU",
+            "plat_form": "unknown",
+            "ip": "180.125.10.108",
+            "last_login_time": "2026-08-11 13:08:27",
+            "device_type": "未知设备",
+            "key": "289d63d26a048fc0c8c7d8607895d611",
+            "cur_device": True,
+            "login_type": "账号登录",
+        },
+        {
+            "device_name": "Chrome",
+            "plat_form": "web",
+            "ip": "180.125.10.108",
+            "last_login_time": "2026-08-11 13:02:31",
+            "device_type": "Windows网页版",
+            "key": "39ba2b6a533a7bafb4cf0064b2a4a567",
+            "cur_device": False,
+            "login_type": "账号登录",
+        },
+    ]
+    acc_a.client._fake.devices = fake_dev_b
+    acc_a.client._fake.device_list_shape = "DeviceS"
+    devs = api.device_list()
+    d0 = [d for d in devs if d["name"] == "盘A"][0]
+    check(d0["count"] == 2, f"DeviceS 格式解析: {d0['count']} 台设备")
+    check(
+        d0["devices"][0]["id"] == "289d63d26a048fc0c8c7d8607895d611"
+        and d0["devices"][0]["time"] == "2026-08-11 13:08:27"
+        and d0["devices"][0]["platform"] == "未知设备",
+        "DeviceS 蛇形字段解析正确",
+    )
+    check(
+        d0["devices"][1]["name"] == "Chrome"
+        and d0["devices"][1]["platform"] == "Windows网页版",
+        "DeviceS 真实设备字段解析",
+    )
+    del acc_a.client._fake.device_list_shape
+
+    print("== 16. 强制重新登录 ==")
+    acc_a.client._fake.relogin_calls = 0
+    acc_b.client._fake.relogin_calls = 0
+    results = api.relogin_all()
+    check(all(r["ok"] for r in results), "强制重新登录全部成功")
+    check(
+        acc_a.client._fake.relogin_calls == 1
+        and acc_b.client._fake.relogin_calls == 1,
+        f"每个账号各重登一次: A={acc_a.client._fake.relogin_calls} B={acc_b.client._fake.relogin_calls}",
+    )
+    check(
+        results[0]["message"] == "重新登录成功（新 token 已持久化）",
+        "重登结果消息",
+    )
 
     print()
     print(f"结果: {passed} 通过, {failed} 失败")
