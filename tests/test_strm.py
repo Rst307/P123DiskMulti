@@ -1054,5 +1054,66 @@ check(
 )
 check(len(fake_g.upload_request_calls) == 0, "后台预建同样不调用秒传")
 
+# 11.17 并发播放（Emby HEAD+GET 几乎同时到达）不得互相挤掉缓存记录：
+#     旧实现缓存 happy path 用 take（破坏性 pop），请求 A 取走记录换票的
+#     ~0.7s 窗口内请求 B 取不到 -> 重新完整定位（8s 超时回退 VIP）甚至
+#     重复建分享（雷神4 曾 1 秒内建两个分享）；改为 peek 非破坏性读取后
+#     并发请求共用同一条分享记录
+from P123DiskMulti import share_ticket as _st_mod  # noqa: E402
+import threading as _th
+
+fake_g.share_create_calls.clear()
+fake_g.fs_list_new_calls.clear()
+helper12._on_demand_share_cache.take(("盘G", "md5-deep", 777))
+_seed = {
+    "share_id": "s-17",
+    "share_key": "k-17",
+    "share_pwd": "",
+    "file_id": deep_ent["FileId"],
+    "s3_key_flag": "s3",
+    "expired_at": time.time() + 3600,
+}
+helper12._on_demand_share_cache.set(("盘G", "md5-deep", 777), _seed)
+_orig_post = _st_mod.requests.post
+
+def _slow_post(url, **kwargs):
+    time.sleep(0.2)  # 模拟慢换票：放大 take 窗口，让并发竞争必现
+    return _orig_post(url, **kwargs)
+
+_st_mod.requests.post = _slow_post
+try:
+    outs = {}
+
+    def _play(i):
+        outs[i] = get_on_demand_share_url(
+            acc_g, "盘G", "zDEEP.mkv", "md5-deep", 777,
+            ttl_days=7, share_pwd="",
+            ticket_cache=helper12._share_ticket_cache,
+            share_cache=helper12._on_demand_share_cache,
+            timeout=8, locate_timeout=0.0,
+        )
+
+    t_a = _th.Thread(target=_play, args=(1,))
+    t_b = _th.Thread(target=_play, args=(2,))
+    t_a.start()
+    time.sleep(0.05)  # A 已取走/peek 到记录并进入换票
+    t_b.start()
+    t_a.join()
+    t_b.join()
+    check(
+        outs.get(1) == "http://edge.example/file"
+        and outs.get(2) == "http://edge.example/file",
+        f"并发播放均直接命中缓存分享: {outs}",
+    )
+    check(len(fake_g.share_create_calls) == 0, "并发播放不重复建分享")
+    check(len(fake_g.fs_list_new_calls) == 0, "并发播放不重新定位（未触发全局搜索）")
+finally:
+    _st_mod.requests.post = _orig_post
+rec_now = helper12._on_demand_share_cache.peek(("盘G", "md5-deep", 777))
+check(
+    rec_now and rec_now.get("share_id") == "s-17",
+    "缓存记录未被破坏性取出（仍在、仍是原分享）",
+)
+
 print(f"\n结果: {passed} 通过, {failed} 失败")
 sys.exit(1 if failed else 0)

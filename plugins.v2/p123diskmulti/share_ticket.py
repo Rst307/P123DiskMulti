@@ -497,13 +497,20 @@ class OnDemandShareCache:
     """按需分享元数据缓存：key=(disk_name, etag, size) -> 分享记录
 
     记录含 share_id/share_key/share_pwd/file_id/s3_key_flag/expired_at；
-    分享到期后条目不再命中（take 会取回旧记录供调用方清理旧分享）。
+    分享到期后条目不再命中。peek 非破坏性读取（并发播放共用一条记录），
+    take 仅在重建/取消时使用（旧实现 happy path 用 take，换票窗口内其他
+    并发请求取不到记录，Emby HEAD+GET 必有一个落入完整定位）。
     """
 
     def __init__(self, maxsize: int = _MAX_ON_DEMAND_CACHE):
         self._lock = threading.Lock()
         self._items: Dict[tuple, dict] = {}
         self._maxsize = maxsize
+
+    def peek(self, key: tuple) -> Optional[dict]:
+        """非破坏性读取：记录保留在缓存中，供并发请求共用"""
+        with self._lock:
+            return self._items.get(key)
 
     def take(self, key: tuple) -> Optional[dict]:
         """原子取走记录（无论是否过期），供调用方复用或清理"""
@@ -806,11 +813,11 @@ def _warm_share_async(
         if key in _WARM_INFLIGHT:
             return
         if share_cache:
-            rec = share_cache.take(key)
+            rec = share_cache.peek(key)
             if rec and rec.get("expired_at", 0) > time.time():
-                share_cache.set(key, rec)  # 其他线程已建好
-                return
+                return  # 已建好（peek 非破坏，不取走记录）
             if rec:  # 已过期：后台线程负责重建（旧分享到期自清理）
+                share_cache.take(key)
                 _cancel_share(account.client, rec.get("share_id"))
         _WARM_INFLIGHT.add(key)
 
@@ -890,9 +897,11 @@ def get_on_demand_share_url(
         logger.error("【123多盘】按需分享换票缺少登录态（账号未登录）")
         return None
     key = (disk_name, md5, int(size or 0))
-    rec = share_cache.take(key) if share_cache else None
+    rec = share_cache.peek(key) if share_cache else None
     if rec:
         if rec.get("expired_at", 0) <= time.time():
+            if share_cache:
+                share_cache.take(key)  # 移除旧记录
             _cancel_share(account.client, rec.get("share_id"))  # 到期自动清理
             rec = None
         else:
@@ -914,13 +923,13 @@ def get_on_demand_share_url(
                 client=account.client,
             )
             if url:
-                if share_cache:
-                    share_cache.set(key, rec)
                 return url
             # 换票/解析失败：分享可能被风控或失效 -> 重建
             logger.warn(
                 f"【123多盘】按需分享 {name} 换票失败，取消旧分享后重建"
             )
+            if share_cache:
+                share_cache.take(key)
             _cancel_share(account.client, rec.get("share_id"))
             rec = None
     # 建新分享（定位原文件：全局搜索优先、遍历兜底，纯查询不创建副本）
