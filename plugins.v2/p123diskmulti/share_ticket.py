@@ -23,7 +23,10 @@
 """
 
 import base64
+import heapq
+import re
 import threading
+from contextlib import contextmanager
 import time
 from datetime import datetime, timedelta
 from typing import Dict, Optional, Set, Tuple
@@ -475,16 +478,44 @@ def get_share_download_url(
 
 ON_DEMAND_API_BASE = "https://api.123278.com/b"
 _MAX_ON_DEMAND_CACHE = 128
-# 全局搜索最多翻页数（每页 100 条）：单文件命中通常在第 1 页
+# 每个搜索关键词最多翻页数（每页 100 条）；会依次尝试完整名、尾部高区分度
+# 词和标题词。SearchData 只是加速器，索引漏项时仍会进入游标遍历兜底。
 _MAX_SEARCH_PAGES = 5
-# 遍历兜底上限（防超大网盘拖垮首次播放）：超过即放弃并提示用户
-_MAX_WALK_DIRS = 500
-_MAX_WALK_ITEMS = 20000
 # auto 模式按需定位时间预算（秒）：超过立即回退 VIP 直链，后台继续定位并预建分享
 ON_DEMAND_LOCATE_TIMEOUT = 8.0
 # 后台预建分享 in-flight 去重（并发播放 HEAD+GET 同时超时时只预建一次）
 _WARM_LOCK = threading.Lock()
 _WARM_INFLIGHT: Set[tuple] = set()
+
+
+class _KeyedLockPool:
+    """按文件 key 串行化冷缓存生产；不同文件仍完全并行。"""
+
+    def __init__(self):
+        self._guard = threading.Lock()
+        self._entries: Dict[tuple, list] = {}
+
+    @contextmanager
+    def hold(self, key: tuple):
+        with self._guard:
+            entry = self._entries.get(key)
+            if entry is None:
+                entry = [threading.Lock(), 0]
+                self._entries[key] = entry
+            entry[1] += 1
+        lock = entry[0]
+        lock.acquire()
+        try:
+            yield
+        finally:
+            lock.release()
+            with self._guard:
+                entry[1] -= 1
+                if entry[1] <= 0 and self._entries.get(key) is entry:
+                    self._entries.pop(key, None)
+
+
+_ON_DEMAND_BUILD_LOCKS = _KeyedLockPool()
 
 
 def on_demand_expire_iso(days: int) -> str:
@@ -494,7 +525,7 @@ def on_demand_expire_iso(days: int) -> str:
 
 
 class OnDemandShareCache:
-    """按需分享元数据缓存：key=(disk_name, etag, size) -> 分享记录
+    """按需分享元数据缓存：key=(disk_name, s3_key_flag, etag, size) -> 分享记录
 
     记录含 share_id/share_key/share_pwd/file_id/s3_key_flag/expired_at；
     分享到期后条目不再命中。peek 非破坏性读取（并发播放共用一条记录），
@@ -539,6 +570,98 @@ class OnDemandShareCache:
             return len(self._items)
 
 
+def _identity_matches(item: dict, md5: str, size, s3_key_flag: str = "") -> bool:
+    """校验云端条目身份：内容必须一致；有 S3KeyFlag 时还必须是同一对象"""
+    if str(item.get("Type", 0)) in ("1", "True"):
+        return False
+    if int(item.get("Size") or 0) != int(size or 0):
+        return False
+    if str(item.get("Etag") or "").lower() != str(md5 or "").lower():
+        return False
+    expected_s3 = str(s3_key_flag or "")
+    actual_s3 = str(item.get("S3KeyFlag") or "")
+    return not expected_s3 or actual_s3 == expected_s3
+
+
+def _search_keywords(name: str):
+    """生成少量高价值搜索词：完整名 → 尾部词 → 标题词（去重）
+
+    123 的 SearchData 存在单文件漏索引：实测完整「雷神3…Atmos.mkv」
+    搜不到 mkv，但搜索 ``Atmos.mkv`` 可命中。文件身份仍由 S3+md5+size
+    校验，关键词只负责缩小候选集，不影响正确性。
+    """
+    raw = str(name or "").strip()
+    if not raw:
+        return []
+    values = []
+
+    def add(value: str):
+        value = str(value or "").strip()[:128]
+        if value and value not in values:
+            values.append(value)
+
+    add(raw)
+    # 最后一个空白分隔词通常是编码/音轨尾词，且保留扩展名，区分度高。
+    tail = raw.rsplit(None, 1)[-1]
+    if len(tail) >= 5:
+        add(tail)
+    stem = raw.rsplit(".", 1)[0] if "." in raw else raw
+    title = re.split(r"[.\[\](){}\s]+", stem, maxsplit=1)[0]
+    if len(title) >= 4:
+        add(title)
+    return values
+
+
+def _directory_priority(dirname: str, target_name: str) -> int:
+    """目录与目标片名的相关度；仅改变访问顺序，不裁剪任何目录"""
+    target = str(target_name or "").lower()
+    current = str(dirname or "").lower()
+    if not target or not current:
+        return 0
+    normalize = lambda s: re.sub(r"[^0-9a-z\u4e00-\u9fff]+", "", s)
+    nt, nd = normalize(target), normalize(current)
+    score = 0
+    if nd and len(nd) >= 4 and (nd in nt or nt in nd):
+        score += 100
+    generic = {
+        "mkv", "mp4", "avi", "mov", "ts", "bluray", "remux", "web", "webdl",
+        "hevc", "h264", "h265", "2160p", "1080p", "720p", "truehd", "dts",
+        "电影", "剧集", "movie", "movies", "tv",
+    }
+    token_re = r"[\u4e00-\u9fff]+|[a-z0-9]+"
+    target_tokens = {x for x in re.findall(token_re, target) if x not in generic}
+    dir_tokens = {x for x in re.findall(token_re, current) if x not in generic}
+    score += sum(min(len(x), 16) for x in target_tokens & dir_tokens)
+    return score
+
+
+def _locate_by_file_id(
+    client, file_id, md5: str, size, s3_key_flag: str = ""
+):
+    """新 STRM 快路径：一次 fs_info 校验 FileId，失效/错盘时静默降级搜索"""
+    try:
+        file_id = int(file_id or 0)
+    except (TypeError, ValueError):
+        return None
+    if file_id <= 0:
+        return None
+    try:
+        resp = client.fs_info(file_id)
+        check_response(resp)
+        data = resp.get("data") or {}
+        items = data.get("infoList") or data.get("InfoList") or []
+        item = items[0] if items else None
+        if item and _identity_matches(item, md5, size, s3_key_flag):
+            actual_id = item.get("FileId") or item.get("fileId") or file_id
+            return int(actual_id), str(item.get("S3KeyFlag") or s3_key_flag or "")
+        logger.debug(
+            f"【123多盘】STRM FileId {file_id} 已失效或身份不匹配，降级盘内搜索"
+        )
+    except Exception as e:
+        logger.debug(f"【123多盘】STRM FileId {file_id} 直达校验失败，降级盘内搜索: {e}")
+    return None
+
+
 def _search_file(
     client,
     name: str,
@@ -547,103 +670,102 @@ def _search_file(
     user_agent: str = "",
     base_url: str = ON_DEMAND_API_BASE,
     deadline: Optional[float] = None,
+    s3_key_flag: str = "",
 ):
-    """全局搜索定位：GET file/list/new（SearchData 按文件名搜索，跨整个网盘）
-
-    文件名仅作搜索关键字，结果按 etag+size 精确命中才采用（避免同名不同内容
-    的文件被误定位）；命中返回 (原文件 file_id, s3_key_flag)。纯查询，
-    不会在网盘创建任何副本。
-    返回 (located, rejected)：命中时 located 为 (file_id, s3_key_flag) 元组，
-    否则为 None；rejected 表示请求被接口拒绝（401 登录态失效），调用方据此
-    区分「未命中」与「被拒绝」。deadline 非空时超时立即放弃（返回未命中）。
-    """
-    keyword = str(name or "").strip()
-    if not keyword:
+    """全局搜索定位：多关键词 SearchData 加速，身份用 S3+etag+size 精确校验"""
+    keywords = _search_keywords(name)
+    if not keywords:
         return None, False
-    if len(keyword) > 128:
-        # 超长文件名截断为无扩展名主干（搜索关键字过长可能被服务端拒绝）
-        stem = keyword.rsplit(".", 1)[0] if "." in keyword else keyword
-        keyword = stem[:128]
-    for page in range(1, _MAX_SEARCH_PAGES + 1):
-        if deadline is not None and time.time() >= deadline:
-            return None, False
-        try:
-            resp = client.fs_list_new(
-                {
-                    "SearchData": keyword,
-                    "Page": page,
-                    "limit": 100,
-                    "operateType": 2,
-                    "fileCategory": 0,
-                },
-                base_url=base_url,
-                headers=_web_headers(user_agent),
-            )
-            check_response(resp)
-        except P123AuthenticationError as e:
-            # 附 token 形态便于诊断：123 网关对非 JWT 格式的 Bearer 值返回
-            # 「token contains an invalid number of segments」（正常 JWT 为
-            # 三段式），长度+段数一眼可辨是过期重登问题还是 token 已损坏。
-            live_token = getattr(client, "token", "") or ""
-            logger.warn(
-                f"【123多盘】按需分享搜索定位请求被拒绝（账号登录态失效或接口 401）：{e}"
-                f"（当前 token 长度 {len(live_token)}，段数 {live_token.count('.')}）"
-            )
-            return None, True
-        except Exception as e:
-            logger.warn(f"【123多盘】按需分享搜索定位请求失败: {e}")
-            return None, False
-        data = resp.get("data") or {}
-        items = data.get("InfoList") or data.get("infoList") or []
-        for it in items:
-            if str(it.get("Type", 0)) in ("1", "True"):
-                continue  # 目录
-            if int(it.get("Size") or 0) != int(size or 0):
-                continue
-            if str(it.get("Etag") or "").lower() != str(md5 or "").lower():
-                continue
-            file_id = it.get("FileId") or it.get("fileId") or it.get("FileID")
-            if not file_id:
-                continue
-            return (int(file_id), str(it.get("S3KeyFlag") or "")), False
-        if not items or str(data.get("Next") or "") == "-1":
-            break
+    for keyword in keywords:
+        for page in range(1, _MAX_SEARCH_PAGES + 1):
+            if deadline is not None and time.time() >= deadline:
+                return None, False
+            try:
+                resp = client.fs_list_new(
+                    {
+                        "SearchData": keyword,
+                        "Page": page,
+                        "limit": 100,
+                        "operateType": 2,
+                        "fileCategory": 0,
+                    },
+                    base_url=base_url,
+                    headers=_web_headers(user_agent),
+                )
+                check_response(resp)
+            except P123AuthenticationError as e:
+                live_token = getattr(client, "token", "") or ""
+                logger.warn(
+                    f"【123多盘】按需分享搜索定位请求被拒绝（账号登录态失效或接口 401）：{e}"
+                    f"（当前 token 长度 {len(live_token)}，段数 {live_token.count('.')}）"
+                )
+                return None, True
+            except Exception as e:
+                logger.warn(f"【123多盘】按需分享搜索定位请求失败: {e}")
+                return None, False
+            data = resp.get("data") or {}
+            items = data.get("InfoList") or data.get("infoList") or []
+            for it in items:
+                if not _identity_matches(it, md5, size, s3_key_flag):
+                    continue
+                found_id = it.get("FileId") or it.get("fileId") or it.get("FileID")
+                if found_id:
+                    return (int(found_id), str(it.get("S3KeyFlag") or "")), False
+            if not items:
+                break
+            # 实际接口 Page 可翻页；部分响应/fake 的 Next 恒为 -1，需兼容 Total。
+            try:
+                has_more = int(data.get("Total") or 0) > page * 100
+            except (TypeError, ValueError):
+                has_more = False
+            if not has_more and str(data.get("Next") or "") == "-1":
+                break
     return None, False
 
 
-def _walk_find_file(client, md5: str, size, deadline: Optional[float] = None):
-    """遍历兜底定位：BFS 递归 fs_list，按 etag+size 精确匹配原文件
+def _walk_find_file(
+    client,
+    md5: str,
+    size,
+    deadline: Optional[float] = None,
+    name: str = "",
+    s3_key_flag: str = "",
+):
+    """游标遍历兜底：相关目录优先，最终仍完整扫描，纯查询不创建副本
 
-    仅当全局搜索未命中时使用（如文件已被改名，搜索不到）；纯查询，
-    不创建任何副本。带目录/条目上限防止超大网盘拖垮首次播放。
-    deadline 非空时超时立即返回 None（不抛异常），供 auto 模式限时定位。
-
-    ⚠️ 分页必须用 next 游标（服务端实测忽略 Page 参数，传 next=0 永远返回
-    第一页）：旧实现 Page 递增 + next 固定 0，目录条目超过 100 时永远
-    看不到第 2 页，遍历兜底形同虚设（复现：雷神3 定位失败）。
+    分页只以服务端 Next 为准：123 实测忽略 Page，短页也不代表末页。
+    auto 前台由 deadline 限时；后台/on_demand 不设人为目录/条目上限，避免
+    把「遍历未完成」误报为「文件不存在」。重复游标会中止，防止死循环。
     """
-    size = int(size or 0)
     visited = set()
-    queue = [0]
-    dirs_seen = 0
-    items_seen = 0
-    while queue:
+    queued = {"0"}
+    heap = [(0, 0, 0)]  # (-相关度, 入队序号, parentFileId)
+    seq = 0
+    while heap:
         if deadline is not None and time.time() >= deadline:
             return None
-        parent = queue.pop(0)
+        _, _, parent = heapq.heappop(heap)
         if str(parent) in visited:
             continue
         visited.add(str(parent))
         page = 1
-        _next = 0
+        cursor = 0
+        seen_cursors = set()
         while True:
             if deadline is not None and time.time() >= deadline:
                 return None
+            cursor_key = str(cursor)
+            if cursor_key in seen_cursors:
+                logger.warn(
+                    f"【123多盘】按需分享遍历定位遇到重复 Next 游标（目录 {parent}），中止以避免死循环"
+                )
+                return None
+            seen_cursors.add(cursor_key)
             try:
                 resp = client.fs_list(
                     {
                         "limit": 100,
-                        "next": _next,
+                        "next": cursor,
                         "Page": page,
                         "parentFileId": int(parent),
                         "inDirectSpace": "false",
@@ -662,36 +784,32 @@ def _walk_find_file(client, md5: str, size, deadline: Optional[float] = None):
                 return None
             data = resp.get("data") or {}
             items = data.get("InfoList") or data.get("infoList") or []
-            if not items:
-                break
             for it in items:
-                items_seen += 1
-                if items_seen > _MAX_WALK_ITEMS:
-                    logger.warn(
-                        f"【123多盘】按需分享遍历定位超过 {_MAX_WALK_ITEMS} 项仍未命中，放弃"
-                    )
-                    return None
                 if str(it.get("Type", 0)) in ("1", "True"):
-                    queue.append(it.get("FileId") or it.get("fileId") or 0)
+                    child_id = it.get("FileId") or it.get("fileId") or 0
+                    if child_id and str(child_id) not in queued:
+                        queued.add(str(child_id))
+                        seq += 1
+                        priority = _directory_priority(it.get("FileName") or "", name)
+                        heapq.heappush(heap, (-priority, seq, int(child_id)))
                     continue
-                if int(it.get("Size") or 0) != size:
+                if not _identity_matches(it, md5, size, s3_key_flag):
                     continue
-                if str(it.get("Etag") or "").lower() != str(md5 or "").lower():
-                    continue
-                file_id = it.get("FileId") or it.get("fileId") or it.get("FileID")
-                if not file_id:
-                    continue
-                return int(file_id), str(it.get("S3KeyFlag") or "")
-            if len(items) < 100 or str(data.get("Next") or "") == "-1":
+                found_id = it.get("FileId") or it.get("fileId") or it.get("FileID")
+                if found_id:
+                    return int(found_id), str(it.get("S3KeyFlag") or "")
+            next_cursor = data.get("Next")
+            if str(next_cursor or "") == "-1":
                 break
-            _next = data.get("Next")
+            if next_cursor in (None, ""):
+                # 空目录常无 Next，可正常结束；非空页无游标则响应不完整。
+                if items:
+                    logger.warn(
+                        f"【123多盘】按需分享遍历定位响应缺少 Next（目录 {parent}），中止避免漏页误判"
+                    )
+                break
+            cursor = next_cursor
             page += 1
-        dirs_seen += 1
-        if dirs_seen > _MAX_WALK_DIRS:
-            logger.warn(
-                f"【123多盘】按需分享遍历定位超过 {_MAX_WALK_DIRS} 个目录仍未命中，放弃"
-            )
-            return None
     return None
 
 
@@ -704,16 +822,16 @@ def _locate_file(
     user_agent: str = "",
     base_url: str = ON_DEMAND_API_BASE,
     deadline: Optional[float] = None,
+    file_id="",
+    s3_key_flag: str = "",
 ):
-    """定位网盘内原文件：优先全局搜索，未命中再递归遍历兜底
-
-    两者均为纯查询（不调用秒传、不创建任何副本），返回原文件
-    (file_id, s3_key_flag)；找不到返回 (None, timed_out)。
-    deadline 非空时超时立即放弃：timed_out=True 表示因限时放弃
-    （auto 模式据此回退 VIP 并后台预建分享），False 表示真正未找到。
-    """
+    """三级定位：FileId 精确快路径 → SearchData 多关键词 → 游标完整遍历"""
+    located = _locate_by_file_id(client, file_id, md5, size, s3_key_flag)
+    if located:
+        return located, False
     located, rejected = _search_file(
-        client, name, md5, size, user_agent, base_url, deadline=deadline
+        client, name, md5, size, user_agent, base_url,
+        deadline=deadline, s3_key_flag=s3_key_flag,
     )
     if located:
         return located, False
@@ -721,16 +839,16 @@ def _locate_file(
         return None, True
     if rejected:
         logger.warn(
-            f"【123多盘】按需分享全局搜索被拒绝（401 登录态失效），直接遍历网盘定位"
+            "【123多盘】按需分享全局搜索被拒绝（401 登录态失效），直接遍历网盘定位"
             "（仅按需，可能较慢）"
         )
     else:
         logger.warn(
-            f"【123多盘】按需分享全局搜索未命中（{name or md5}），改为遍历网盘定位（仅按需，可能较慢）"
+            f"【123多盘】按需分享全局搜索未命中（{name or md5}），改为相关目录优先遍历"
         )
-    return _walk_find_file(client, md5, size, deadline=deadline), (
-        deadline is not None and time.time() >= deadline
-    )
+    return _walk_find_file(
+        client, md5, size, deadline=deadline, name=name, s3_key_flag=s3_key_flag
+    ), (deadline is not None and time.time() >= deadline)
 
 
 def _create_share(
@@ -802,6 +920,8 @@ def _warm_share_async(
     ticket_cache,
     share_cache,
     key: tuple,
+    file_id="",
+    s3_key_flag: str = "",
 ):
     """后台预建按需分享：定位原文件 + 建分享 + 写缓存（幂等）
 
@@ -830,22 +950,26 @@ def _warm_share_async(
                 md5=md5,
                 size=size,
                 user_agent=user_agent,
+                file_id=file_id,
+                s3_key_flag=s3_key_flag,
             )
             if not located:
                 logger.warn(
                     f"【123多盘】后台预建分享定位失败（{name}），放弃预建"
                 )
                 return
-            file_id, s3_flag = located
-            share = _create_share(account.client, file_id, name, ttl_days, share_pwd)
+            located_file_id, located_s3_flag = located
+            share = _create_share(
+                account.client, located_file_id, name, ttl_days, share_pwd
+            )
             if not share:
                 return
             rec = {
                 "share_id": share["share_id"],
                 "share_key": share["share_key"],
                 "share_pwd": share["share_pwd"],
-                "file_id": file_id,
-                "s3_key_flag": s3_flag,
+                "file_id": located_file_id,
+                "s3_key_flag": located_s3_flag,
                 "expired_at": time.time() + max(1, int(ttl_days)) * 86400,
             }
             if share_cache:
@@ -864,75 +988,45 @@ def _warm_share_async(
     ).start()
 
 
-def get_on_demand_share_url(
-    account,
-    disk_name: str,
-    name: str,
-    md5: str,
-    size,
-    ttl_days: int = 7,
-    share_pwd: str = "",
-    user_agent: str = "",
-    ticket_cache: Optional[ShareTicketCache] = None,
-    share_cache: Optional[OnDemandShareCache] = None,
-    timeout: float = 8,
-    locate_timeout: float = 0.0,
+def _exchange_on_demand_record(
+    account, rec: dict, md5: str, size, share_pwd: str,
+    user_agent: str, ticket_cache, timeout: float,
 ) -> Optional[str]:
-    """按需分享票完整链路（懒建分享）
-
-    1. 缓存命中且分享未过期 -> 复用该分享换票播放（同一文件有效期内只建一次分享）
-    2. 分享已过期 -> 先取消旧分享（到期自清理），再建新分享
-    3. 换票/解析失败（分享被风控或失效）-> 取消旧分享重建，重试一次
-    4. 定位/建分享/换票失败均返回 None，日志明确原因
-    5. locate_timeout>0 时限时定位（auto 模式）：超时立即返回 None（由调用方
-       回退 VIP 直链，避免大网盘遍历拖垮首次播放），同时后台继续定位并预建
-       分享，下次播放命中缓存秒开
-    :return: 可直接 302 给 Emby 的最终边缘 URL；失败 None
-    """
-    if not md5 or not size:
-        logger.error("【123多盘】按需分享需要文件的 md5 与 size（STRM URL 参数缺失）")
-        return None
+    """用一条已建分享记录换票；始终读取客户端当前 token。"""
     token = getattr(account.client, "token", "") or ""
     if not token:
         logger.error("【123多盘】按需分享换票缺少登录态（账号未登录）")
         return None
-    key = (disk_name, md5, int(size or 0))
-    rec = share_cache.peek(key) if share_cache else None
-    if rec:
-        if rec.get("expired_at", 0) <= time.time():
-            if share_cache:
-                share_cache.take(key)  # 移除旧记录
-            _cancel_share(account.client, rec.get("share_id"))  # 到期自动清理
-            rec = None
-        else:
-            token = getattr(account.client, "token", "") or ""
-            if not token:
-                logger.error("【123多盘】按需分享换票缺少登录态（账号未登录）")
-                return None
-            url = get_share_download_url(
-                token,
-                rec["share_key"],
-                rec.get("share_pwd") or share_pwd,
-                rec["file_id"],
-                rec.get("s3_key_flag", ""),
-                md5,
-                size,
-                user_agent=user_agent,
-                cache=ticket_cache,
-                timeout=timeout,
-                client=account.client,
+    return get_share_download_url(
+        token,
+        rec["share_key"],
+        rec.get("share_pwd") or share_pwd,
+        rec["file_id"],
+        rec.get("s3_key_flag", ""),
+        md5,
+        size,
+        user_agent=user_agent,
+        cache=ticket_cache,
+        timeout=timeout,
+        client=account.client,
+    )
+
+
+def _build_on_demand_share_url(
+    account, disk_name: str, name: str, md5: str, size,
+    ttl_days: int, share_pwd: str, user_agent: str,
+    ticket_cache, share_cache, timeout: float, locate_timeout: float,
+    file_id, s3_key_flag: str, key: tuple,
+) -> Optional[str]:
+    """冷缓存生产者：定位 → 建分享 → 先写缓存 → 换票。调用方保证同 key 单飞。"""
+    if locate_timeout and float(locate_timeout) > 0:
+        with _WARM_LOCK:
+            warming = key in _WARM_INFLIGHT
+        if warming:
+            logger.debug(
+                f"【123多盘】{name} 已在后台定位预建，本次直接回退 VIP，不重复遍历"
             )
-            if url:
-                return url
-            # 换票/解析失败：分享可能被风控或失效 -> 重建
-            logger.warn(
-                f"【123多盘】按需分享 {name} 换票失败，取消旧分享后重建"
-            )
-            if share_cache:
-                share_cache.take(key)
-            _cancel_share(account.client, rec.get("share_id"))
-            rec = None
-    # 建新分享（定位原文件：全局搜索优先、遍历兜底，纯查询不创建副本）
+            return None
     deadline = (
         time.time() + float(locate_timeout)
         if locate_timeout and float(locate_timeout) > 0
@@ -946,10 +1040,11 @@ def get_on_demand_share_url(
         size=size,
         user_agent=user_agent,
         deadline=deadline,
+        file_id=file_id,
+        s3_key_flag=s3_key_flag,
     )
     if not located:
         if timed_out:
-            # 限时未命中：本次回退 VIP 直链，后台继续定位并预建分享（下次秒开）
             logger.warn(
                 f"【123多盘】按需分享定位超过 {float(locate_timeout):.1f}s 未命中（{name}），"
                 "本次回退 VIP 直链，已后台继续定位并预建分享（下次播放秒开）"
@@ -966,16 +1061,20 @@ def get_on_demand_share_url(
                 ticket_cache=ticket_cache,
                 share_cache=share_cache,
                 key=key,
+                file_id=file_id,
+                s3_key_flag=s3_key_flag,
             )
             return None
         logger.error(
             f"【123多盘】按需分享定位文件失败（{name}，md5={md5}，size={size}）："
-            "已尝试全局搜索与遍历，网盘中未找到原文件，请确认 STRM 与网盘数据一致"
-            "（文件名/大小/md5），或切换回 VIP 直链模式"
+            "已尝试 FileId、全局搜索与遍历，网盘中未找到原文件，请确认 STRM 与网盘数据一致"
+            "（文件身份/大小/md5），或切换回 VIP 直链模式"
         )
         return None
-    file_id, s3_flag = located
-    share = _create_share(account.client, file_id, name, ttl_days, share_pwd)
+    located_file_id, located_s3_flag = located
+    share = _create_share(
+        account.client, located_file_id, name, ttl_days, share_pwd
+    )
     if not share:
         logger.error(
             f"【123多盘】按需分享建分享失败（{name}），请稍后重试或切换 VIP 直链模式"
@@ -989,23 +1088,78 @@ def get_on_demand_share_url(
         "share_id": share["share_id"],
         "share_key": share["share_key"],
         "share_pwd": share["share_pwd"],
-        "file_id": file_id,
-        "s3_key_flag": s3_flag,
+        "file_id": located_file_id,
+        "s3_key_flag": located_s3_flag,
         "expired_at": time.time() + max(1, int(ttl_days)) * 86400,
     }
-    url = get_share_download_url(
-        token,
-        rec["share_key"],
-        rec["share_pwd"],
-        file_id,
-        s3_flag,
-        md5,
-        size,
-        user_agent=user_agent,
-        cache=ticket_cache,
-        timeout=timeout,
-        client=account.client,
-    )
-    if url and share_cache:
+    # 先发布再换票：等待中的 HEAD/GET 可复用同一分享；即便本次换票网络失败，
+    # 下次也先重试该分享，不会立刻重复创建。
+    if share_cache:
         share_cache.set(key, rec)
-    return url
+    return _exchange_on_demand_record(
+        account, rec, md5, size, share_pwd,
+        user_agent, ticket_cache, timeout,
+    )
+
+
+def get_on_demand_share_url(
+    account,
+    disk_name: str,
+    name: str,
+    md5: str,
+    size,
+    ttl_days: int = 7,
+    share_pwd: str = "",
+    user_agent: str = "",
+    ticket_cache: Optional[ShareTicketCache] = None,
+    share_cache: Optional[OnDemandShareCache] = None,
+    timeout: float = 8,
+    locate_timeout: float = 0.0,
+    file_id="",
+    s3_key_flag: str = "",
+) -> Optional[str]:
+    """按需分享完整链路；冷缓存按文件 single-flight，缓存命中可并行换票。"""
+    if not md5 or not size:
+        logger.error("【123多盘】按需分享需要文件的 md5 与 size（STRM URL 参数缺失）")
+        return None
+    if not (getattr(account.client, "token", "") or ""):
+        logger.error("【123多盘】按需分享换票缺少登录态（账号未登录）")
+        return None
+    key = (disk_name, str(s3_key_flag or ""), md5, int(size or 0))
+    failed_share_id = ""
+    rec = share_cache.peek(key) if share_cache else None
+    if rec and rec.get("expired_at", 0) > time.time():
+        url = _exchange_on_demand_record(
+            account, rec, md5, size, share_pwd,
+            user_agent, ticket_cache, timeout,
+        )
+        if url:
+            return url
+        failed_share_id = str(rec.get("share_id") or "")
+        logger.warn(f"【123多盘】按需分享 {name} 换票失败，取消旧分享后重建")
+
+    # 仅冷缓存/失效重建串行化；有效缓存的 HEAD+GET 仍可并行换票。
+    with _ON_DEMAND_BUILD_LOCKS.hold(key):
+        current = share_cache.peek(key) if share_cache else None
+        if current:
+            current_id = str(current.get("share_id") or "")
+            expired = current.get("expired_at", 0) <= time.time()
+            if not expired and current_id != failed_share_id:
+                url = _exchange_on_demand_record(
+                    account, current, md5, size, share_pwd,
+                    user_agent, ticket_cache, timeout,
+                )
+                if url:
+                    return url
+                logger.warn(
+                    f"【123多盘】按需分享 {name} 换票失败，取消旧分享后重建"
+                )
+            removed = share_cache.take(key) if share_cache else current
+            if removed:
+                _cancel_share(account.client, removed.get("share_id"))
+        return _build_on_demand_share_url(
+            account, disk_name, name, md5, size,
+            ttl_days, share_pwd, user_agent,
+            ticket_cache, share_cache, timeout, locate_timeout,
+            file_id, s3_key_flag, key,
+        )

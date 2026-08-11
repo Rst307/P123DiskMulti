@@ -46,7 +46,7 @@ class P123DiskMulti(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/DDSRem-Dev/MoviePilot-Plugins/main/icons/P123Disk.png"
     # 插件版本
-    plugin_version = "1.4.19"
+    plugin_version = "1.4.20"
     # 插件作者
     plugin_author = "Rst307"
     # 作者主页
@@ -2727,7 +2727,7 @@ class P123DiskMulti(_PluginBase):
         """
         123云盘302跳转（STRM 播放端点）
 
-        GET /redirect_url?name=&size=&md5=&s3_key_flag=&disk=
+        GET /redirect_url?name=&size=&md5=&s3_key_flag=&disk=&file_id=
         """
         if not self._strm:
             return JSONResponse(
@@ -2741,6 +2741,7 @@ class P123DiskMulti(_PluginBase):
         except ValueError:
             size = 0
         s3_key_flag = request.query_params.get("s3_key_flag", "")
+        file_id = request.query_params.get("file_id", "")
         user_agent = request.headers.get("User-Agent") or ""
         url = self._strm.resolve_download_url(
             name=name,
@@ -2749,6 +2750,7 @@ class P123DiskMulti(_PluginBase):
             s3_key_flag=s3_key_flag,
             user_agent=user_agent,
             disk_name=disk,
+            file_id=file_id,
         )
         if not url:
             return JSONResponse(

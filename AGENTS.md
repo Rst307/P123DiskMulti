@@ -33,7 +33,7 @@ python tests/test_login.py
 python -c "import ast; ast.parse(open('plugins.v2/p123diskmulti/tool.py', encoding='utf-8').read())"  # 语法检查
 ```
 
-改完代码必须跑全部三个测试文件，回归基线：**38 + 152 + 23 全部通过**。
+改完代码必须跑全部三个核心测试文件，并建议同步跑分享/整理测试；当前回归基线：**83 + 187 + 23**（另：分享 53、整理 50）全部通过。
 
 ## 核心架构
 
@@ -65,7 +65,8 @@ python -c "import ast; ast.parse(open('plugins.v2/p123diskmulti/tool.py', encodi
 - 换票始终以客户端**当前**登录态为准，禁止入口处捕获旧 token 后跨重登使用
 - 5112 时依次尝试 open_platform / android 平台模板，均失败才 `_force_relogin` 重试一次
 - 认证头必须用小写 `authorization` 键（大写 Authorization 会覆盖 p123client 自带头，导致 401）
-- 按需分享（on_demand）：定位用 `file/list/new` 搜索 + `fs_list` 遍历兜底，**禁止用 upload_request 秒传定位**（会在根目录生成重复文件）；**`fs_list` 遍历分页必须用 `next` 游标**（123 服务端忽略 `Page` 参数，next 固定 0 会永远重复第一页，目录超 100 项即定位不到）
+- 按需分享（on_demand）：三级定位顺序固定为 **STRM `file_id` + `fs_info` 身份校验快路径 → `file/list/new` 多关键词搜索 → `fs_list` 相关目录优先遍历兜底**；身份以 `S3KeyFlag+Etag+Size` 精确校验，名称只作搜索提示；**禁止用 upload_request 秒传定位**（会在根目录生成重复文件）
+- `fs_list` 遍历分页必须只以服务端 `Next` 游标为准：123 忽略 `Page`，短页（len<limit）也不等于末页；next 固定 0 会永远重复第一页。冷缓存定位/建分享必须经按文件 key single-flight，防止 Emby HEAD+GET 重复建分享
 
 ## 版本发布约定
 

@@ -101,10 +101,16 @@ check(not helper.is_media_file("a.srt") and not helper.is_media_file(""), "非�
 
 # ============ 2. STRM URL 构建 ============
 print("== 2. STRM URL 构建 ==")
-url = helper.build_strm_url("阿凡达.mkv", 1000, "md5-av", "s3-av", disk_name="盘A")
+url = helper.build_strm_url(
+    "阿凡达.mkv", 1000, "md5-av", "s3-av", disk_name="盘A", file_id="42"
+)
 check(url is not None and url.startswith("http://127.0.0.1:3000/api/v1/plugin/P123DiskMulti/redirect_url"), "URL 前缀正确")
 check("apikey=test-api-token" in url, "URL 含 apikey")
-check("s3_key_flag=s3-av" in url and "md5=md5-av" in url and "size=1000" in url, "URL 含文件参数")
+check(
+    "s3_key_flag=s3-av" in url and "md5=md5-av" in url
+    and "size=1000" in url and "file_id=42" in url,
+    "URL 含文件身份参数（含 FileId 快路径）",
+)
 check("disk=%E7%9B%98A" in url, "URL 含网盘名参数（URL编码）")
 no_addr = StrmHelper(api=api, moviepilot_address="")
 check(no_addr.build_strm_url("a.mkv", 1, "m", "s") is None, "未配置地址时返回 None")
@@ -129,7 +135,11 @@ check(result["ok"] == 3, "生成 3 个 STRM（阿凡达+E01+流浪地球）")
 av_strm = local_a / "阿凡达.strm"
 check(av_strm.exists(), "盘A 电影目录 STRM 生成")
 content = av_strm.read_text(encoding="utf-8")
-check("redirect_url" in content and "s3_key_flag=s3" in content and "apikey=test-api-token" in content, "STRM 内容为 302 URL")
+check(
+    "redirect_url" in content and "s3_key_flag=s3" in content
+    and "apikey=test-api-token" in content and "&file_id=" in content,
+    "STRM 内容为 302 URL（保留 FileId 快路径）",
+)
 check(not (local_a / "阿凡达.srt.strm").exists(), "字幕文件不生成 STRM")
 check(not (local_a / "说明.txt.strm").exists(), "文本文件不生成 STRM")
 check(not (local_a / "BDMV" / "index.bdmv.strm").exists(), "蓝光原盘目录跳过")
@@ -796,7 +806,7 @@ check(dl == "http://edge.example/file", "有效期内二次播放成功")
 check(len(fake_g.share_create_calls) == 0, "有效期内复用分享，不重复建分享")
 
 # 11.3 分享到期：自动取消旧分享并重建
-key_od = ("盘G", "md5-ond", 999)
+key_od = ("盘G", "", "md5-ond", 999)
 od_rec = helper12._on_demand_share_cache.take(key_od)
 od_rec["expired_at"] = time.time() - 1  # 模拟已到期
 helper12._on_demand_share_cache.set(key_od, od_rec)
@@ -963,7 +973,7 @@ fake_g.fail_search_401 = True
 fake_g.fs_list_new_calls.clear()
 fake_g.share_create_calls.clear()
 tl._share_download_calls.clear()
-helper12._on_demand_share_cache.take(("盘G", "md5-ond", 999))
+helper12._on_demand_share_cache.take(("盘G", "", "md5-ond", 999))
 dl = helper12.resolve_download_url("MOV.A.mkv", 999, "md5-ond", "", disk_name="盘G")
 fake_g.fail_search_401 = False
 check(dl == "http://edge.example/file", "搜索 401 被拒时遍历兜底仍播放成功")
@@ -980,7 +990,7 @@ tl.fake_post._response = [dict(LOGIN_RESP)] * 3
 tl._share_download_calls.clear()
 fake_g.relogin_calls = 0
 fake_g.token = "fake-token"
-helper12._on_demand_share_cache.take(("盘G", "md5-ond", 999))
+helper12._on_demand_share_cache.take(("盘G", "", "md5-ond", 999))
 dl = helper12.resolve_download_url("MOV.A.mkv", 999, "md5-ond", "", disk_name="盘G")
 tl.fake_post._response = None
 check(dl == "http://edge.example/file", "按需分享换票 5112 时强制重登后播放成功")
@@ -1007,7 +1017,7 @@ for i in range(150):
 deep_ent = fake_g._entry("zDEEP.mkv", big_dir["FileId"], "file", size=777, etag="md5-deep")
 fake_g.search_off = True
 fake_g.share_create_calls.clear()
-helper12._on_demand_share_cache.take(("盘G", "md5-deep", 777))
+helper12._on_demand_share_cache.take(("盘G", "", "md5-deep", 777))
 dl = helper12.resolve_download_url("zDEEP.mkv", 777, "md5-deep", "", disk_name="盘G")
 fake_g.search_off = False
 check(dl == "http://edge.example/file", "超过 100 项的目录遍历兜底按游标翻页定位成功")
@@ -1024,7 +1034,7 @@ check(len(fake_g.upload_request_calls) == 0, "游标翻页定位同样不调用�
 fake_g.fs_list_sleep = 0.05  # 每次 fs_list 延时（两次调用即超限时预算，保证超时）
 fake_g.search_off = True
 fake_g.share_create_calls.clear()
-helper12._on_demand_share_cache.take(("盘G", "md5-deep", 777))
+helper12._on_demand_share_cache.take(("盘G", "", "md5-deep", 777))
 dl = get_on_demand_share_url(
     acc_g, "盘G", "zDEEP.mkv", "md5-deep", 777,
     ttl_days=7, share_pwd="",
@@ -1038,7 +1048,7 @@ check(dl is None, "定位超过限时预算立即返回 None（回退 VIP 直链
 warm_rec = None
 _poll_end = time.time() + 5
 while time.time() < _poll_end:
-    warm_rec = helper12._on_demand_share_cache.take(("盘G", "md5-deep", 777))
+    warm_rec = helper12._on_demand_share_cache.take(("盘G", "", "md5-deep", 777))
     if warm_rec:
         break
     time.sleep(0.05)
@@ -1064,7 +1074,7 @@ import threading as _th
 
 fake_g.share_create_calls.clear()
 fake_g.fs_list_new_calls.clear()
-helper12._on_demand_share_cache.take(("盘G", "md5-deep", 777))
+helper12._on_demand_share_cache.take(("盘G", "", "md5-deep", 777))
 _seed = {
     "share_id": "s-17",
     "share_key": "k-17",
@@ -1073,7 +1083,7 @@ _seed = {
     "s3_key_flag": "s3",
     "expired_at": time.time() + 3600,
 }
-helper12._on_demand_share_cache.set(("盘G", "md5-deep", 777), _seed)
+helper12._on_demand_share_cache.set(("盘G", "", "md5-deep", 777), _seed)
 _orig_post = _st_mod.requests.post
 
 def _slow_post(url, **kwargs):
@@ -1109,11 +1119,197 @@ try:
     check(len(fake_g.fs_list_new_calls) == 0, "并发播放不重新定位（未触发全局搜索）")
 finally:
     _st_mod.requests.post = _orig_post
-rec_now = helper12._on_demand_share_cache.peek(("盘G", "md5-deep", 777))
+rec_now = helper12._on_demand_share_cache.peek(("盘G", "", "md5-deep", 777))
 check(
     rec_now and rec_now.get("share_id") == "s-17",
     "缓存记录未被破坏性取出（仍在、仍是原分享）",
 )
+
+# 11.18 新 STRM 携带 FileId：只需一次 fs_info 精确校验，完全跳过盘内搜索/遍历
+acc_h = make_account("盘H", 100 * 1024 ** 3, 10 * 1024 ** 3)
+fake_h = acc_h.client._fake
+h_dir = fake_h._entry("电影", 0, "dir")
+h_target = fake_h._entry(
+    "直达电影.mkv", h_dir["FileId"], "file",
+    size=888, etag="md5-direct", s3_key_flag="s3-direct",
+)
+api_h = P123MultiApi(disks=[], disk_name="123云盘")
+api_h._accounts = [acc_h]
+helper15 = StrmHelper(
+    api=api_h, moviepilot_address="http://127.0.0.1:3000", ticket_mode="on_demand",
+)
+fake_h.fs_info_calls.clear()
+fake_h.fs_list_new_calls.clear()
+fake_h.fs_list_calls.clear()
+dl = helper15.resolve_download_url(
+    "直达电影.mkv", 888, "md5-direct", "s3-direct",
+    disk_name="盘H", file_id=str(h_target["FileId"]),
+)
+check(dl == "http://edge.example/file", "FileId 快路径播放成功")
+check(
+    fake_h.fs_info_calls == [h_target["FileId"]],
+    f"FileId 快路径只校验一次文件详情: {fake_h.fs_info_calls}",
+)
+check(len(fake_h.fs_list_new_calls) == 0, "FileId 有效时不调用全局搜索")
+check(len(fake_h.fs_list_calls) == 0, "FileId 有效时不遍历任何目录")
+check(
+    fake_h.share_create_calls
+    and fake_h.share_create_calls[-1]["payload"]["fileIdList"] == str(h_target["FileId"]),
+    "FileId 快路径分享原文件",
+)
+# FileId 指向旧文件/错盘对象时必须校验失败并自动降级，而不是误分享。
+h_stale = fake_h._entry(
+    "新位置.mkv", h_dir["FileId"], "file",
+    size=889, etag="md5-new", s3_key_flag="s3-new",
+)
+fake_h.fs_info_calls.clear()
+fake_h.fs_list_new_calls.clear()
+fake_h.share_create_calls.clear()
+dl = helper15.resolve_download_url(
+    "新位置.mkv", 889, "md5-new", "s3-new",
+    disk_name="盘H", file_id=str(h_target["FileId"]),
+)
+check(dl == "http://edge.example/file", "过期/错误 FileId 自动降级搜索成功")
+check(
+    fake_h.fs_info_calls == [h_target["FileId"]] and fake_h.fs_list_new_calls,
+    "错误 FileId 先精确校验，再进入 SearchData",
+)
+check(
+    fake_h.share_create_calls[-1]["payload"]["fileIdList"] == str(h_stale["FileId"]),
+    "错误 FileId 不会分享错误对象",
+)
+
+# 11.19 123 搜索索引只漏完整长文件名时，自动改用高区分度尾部关键词；
+#       真实故障文件完整名漏索引，但 Atmos.mkv 能命中
+long_name = "雷神3：诸神黄昏.2017.BluRay REMUX.2160p.HEVC.DTS-HD MA TrueHD 7.1 Atmos.mkv"
+# 同名、同 md5/size 的另一副本先返回；只有 S3KeyFlag 能区分目标对象。
+fake_h._entry(
+    long_name, h_dir["FileId"], "file",
+    size=62363580483, etag="md5-thor", s3_key_flag="s3-wrong-copy",
+)
+h_long = fake_h._entry(
+    long_name, h_dir["FileId"], "file",
+    size=62363580483, etag="md5-thor", s3_key_flag="s3-thor",
+)
+fake_h.search_miss_keywords = {long_name.lower()}
+fake_h.fs_list_new_calls.clear()
+fake_h.fs_list_calls.clear()
+fake_h.share_create_calls.clear()
+dl = helper15.resolve_download_url(
+    long_name, 62363580483, "md5-thor", "s3-thor", disk_name="盘H"
+)
+fake_h.search_miss_keywords.clear()
+keywords = [
+    str(c["payload"].get("SearchData") or "")
+    for c in fake_h.fs_list_new_calls
+]
+check(dl == "http://edge.example/file", "完整文件名漏索引时尾部关键词搜索成功")
+check(
+    keywords and keywords[0] == long_name and "Atmos.mkv" in keywords[1:],
+    f"搜索按完整名→高区分度尾词降级: {keywords}",
+)
+check(len(fake_h.fs_list_calls) == 0, "尾部关键词命中后不启动全盘遍历")
+check(
+    fake_h.share_create_calls
+    and fake_h.share_create_calls[-1]["payload"]["fileIdList"] == str(h_long["FileId"]),
+    "尾部关键词结果仍以 S3KeyFlag+md5+size 精确校验",
+)
+
+# 11.20 遍历兜底：短页只认 Next（len<100 不能视为末页），并优先访问
+#       与目标片名相关的目录，避免先扫描大量无关目录
+acc_i = make_account("盘I", 100 * 1024 ** 3, 10 * 1024 ** 3)
+fake_i = acc_i.client._fake
+irrelevant = []
+for i in range(12):
+    d = fake_i._entry(f"A无关目录{i:02d}", 0, "dir")
+    fake_i._entry(f"无关{i:02d}.mkv", d["FileId"], "file", size=i + 1, etag=f"x{i}")
+    irrelevant.append(d["FileId"])
+fast_dir = fake_i._entry("极速电影 (2025)", 0, "dir")
+fake_i._entry("a.txt", fast_dir["FileId"], "file", size=1, etag="a")
+fake_i._entry("b.txt", fast_dir["FileId"], "file", size=2, etag="b")
+i_target = fake_i._entry(
+    "极速电影.2025.mkv", fast_dir["FileId"], "file",
+    size=9999, etag="md5-fast", s3_key_flag="s3-fast",
+)
+fake_i.search_off = True
+fake_i.fs_list_server_limit = 2
+api_i = P123MultiApi(disks=[], disk_name="123云盘")
+api_i._accounts = [acc_i]
+helper16 = StrmHelper(
+    api=api_i, moviepilot_address="http://127.0.0.1:3000", ticket_mode="on_demand",
+)
+fake_i.fs_list_calls.clear()
+dl = helper16.resolve_download_url(
+    "极速电影.2025.mkv", 9999, "md5-fast", "s3-fast", disk_name="盘I"
+)
+parents_called = [int(c.get("parentFileId") or 0) for c in fake_i.fs_list_calls]
+target_cursors = [
+    c.get("next") for c in fake_i.fs_list_calls
+    if int(c.get("parentFileId") or 0) == fast_dir["FileId"]
+]
+check(dl == "http://edge.example/file", "短页游标遍历定位成功")
+check(
+    len(target_cursors) == 2 and target_cursors[1] not in (0, "0", None, ""),
+    f"短页仍按服务端 Next 翻到第 2 页: {target_cursors}",
+)
+check(
+    not any(fid in parents_called for fid in irrelevant),
+    f"片名相关目录优先，无关目录未被访问: {parents_called}",
+)
+check(
+    fake_i.share_create_calls[-1]["payload"]["fileIdList"] == str(i_target["FileId"]),
+    "优先遍历仍严格分享目标原文件",
+)
+
+# 11.21 冷缓存首次播放 single-flight：HEAD+GET 同时 miss 也只能定位/建分享一次
+acc_j = make_account("盘J", 100 * 1024 ** 3, 10 * 1024 ** 3)
+fake_j = acc_j.client._fake
+j_target = fake_j._entry(
+    "冷启动.mkv", 0, "file", size=321, etag="md5-cold", s3_key_flag="s3-cold"
+)
+api_j = P123MultiApi(disks=[], disk_name="123云盘")
+api_j._accounts = [acc_j]
+helper17 = StrmHelper(
+    api=api_j, moviepilot_address="http://127.0.0.1:3000", ticket_mode="on_demand",
+)
+_entered_create = _th.Event()
+_release_create = _th.Event()
+_orig_create_j = fake_j.share_create
+
+def _blocked_create(payload, *args, **kwargs):
+    _entered_create.set()
+    _release_create.wait(2)
+    return _orig_create_j(payload, *args, **kwargs)
+
+fake_j.share_create = _blocked_create
+cold_outs = {}
+
+def _cold_play(i):
+    cold_outs[i] = helper17.resolve_download_url(
+        "冷启动.mkv", 321, "md5-cold", "s3-cold",
+        disk_name="盘J", file_id=str(j_target["FileId"]),
+    )
+
+try:
+    cold_a = _th.Thread(target=_cold_play, args=(1,))
+    cold_b = _th.Thread(target=_cold_play, args=(2,))
+    cold_a.start()
+    check(_entered_create.wait(1), "冷缓存首请求已进入建分享阶段")
+    cold_b.start()  # 首请求尚未发布缓存，第二请求也观察到 miss
+    time.sleep(0.05)
+    _release_create.set()
+    cold_a.join()
+    cold_b.join()
+finally:
+    _release_create.set()
+    fake_j.share_create = _orig_create_j
+check(
+    cold_outs.get(1) == "http://edge.example/file"
+    and cold_outs.get(2) == "http://edge.example/file",
+    f"冷缓存并发请求均播放成功: {cold_outs}",
+)
+check(len(fake_j.share_create_calls) == 1, "冷缓存 HEAD+GET 只创建一个分享")
+check(len(fake_j.fs_info_calls) == 1, "冷缓存 HEAD+GET 只执行一次 FileId 定位")
 
 print(f"\n结果: {passed} 通过, {failed} 失败")
 sys.exit(1 if failed else 0)

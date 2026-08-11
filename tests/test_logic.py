@@ -204,10 +204,14 @@ class FakeP123Client:
         self.share_entries = None  # 分享内文件树（None 时建分享自动快照）
         # 按需分享（OnDemand 测试用）
         self.upload_request_calls = []
+        self.fs_list_calls = []
+        self.fs_info_calls = []
         self.fs_list_new_calls = []
         self.search_off = False  # True 时全局搜索返回空（模拟搜索未命中）
+        self.search_miss_keywords = set()  # 仅指定关键词漏索引（模拟 123 搜索索引缺口）
         self.fail_search_401 = False  # True 时全局搜索抛 401 认证异常（模拟登录态失效）
         self.fs_list_sleep = 0.0  # fs_list 每次调用延时秒数（限时定位测试用）
+        self.fs_list_server_limit = 0  # >0 时服务端强制短页（即使请求 limit=100）
         self.relogin_calls = 0  # 强制重登次数（换票 5112 自愈用）
 
     def relogin(self):
@@ -224,13 +228,13 @@ class FakeP123Client:
     def _now():
         return datetime.now().isoformat()
 
-    def _entry(self, name, parent, ftype, size=0, etag=""):
+    def _entry(self, name, parent, ftype, size=0, etag="", s3_key_flag="s3"):
         eid = self._new_id()
         e = {
             "FileId": eid, "FileName": name,
             "ParentFileId": int(parent) if parent is not None else 0,
             "Type": 1 if ftype == "dir" else 0, "Size": size,
-            "UpdateAt": self._now(), "Etag": etag, "S3KeyFlag": "s3",
+            "UpdateAt": self._now(), "Etag": etag, "S3KeyFlag": s3_key_flag,
         }
         self.entries[eid] = e
         return e
@@ -249,6 +253,7 @@ class FakeP123Client:
         """模拟 file/list：与真实 123 API 一致——只按 next 游标分页，
         Page 参数被忽略（next=0 永远返回第一页）；Next 为下一页首项 FileId，
         无更多时返回 -1。fs_list_sleep>0 时每次调用延时（模拟限时定位测试用）。"""
+        self.fs_list_calls.append(dict(payload))
         parent = payload.get("parentFileId", 0)
         children = self._children(parent)
         children.sort(key=lambda e: e["FileName"])
@@ -256,12 +261,16 @@ class FakeP123Client:
             import time as _t
             _t.sleep(self.fs_list_sleep)
         limit = max(1, int(payload.get("limit", 100)))
+        if getattr(self, "fs_list_server_limit", 0):
+            limit = min(limit, int(self.fs_list_server_limit))
         _next = int(payload.get("next", 0) or 0)
         if _next == 0:
             start = 0
         else:
+            # Next 是不透明的「下一页首项」游标，必须精确匹配；不能按
+            # FileId 数值大小推断位置（响应按文件名排序时两者并不单调）。
             start = next(
-                (i for i, e in enumerate(children) if int(e["FileId"]) >= _next),
+                (i for i, e in enumerate(children) if int(e["FileId"]) == _next),
                 len(children),
             )
         chunk = children[start:start + limit]
@@ -289,9 +298,12 @@ class FakeP123Client:
             )
         search = payload.get("SearchData") or ""
         if search:
-            if getattr(self, "search_off", False):
-                return {"code": 0, "data": {"InfoList": [], "Next": "-1"}}
             kw = str(search).lower()
+            if (
+                getattr(self, "search_off", False)
+                or kw in getattr(self, "search_miss_keywords", set())
+            ):
+                return {"code": 0, "data": {"InfoList": [], "Next": "-1"}}
             matches = [
                 e for e in self.entries.values()
                 if e["Type"] == 0 and kw in str(e["FileName"]).lower()
@@ -313,7 +325,11 @@ class FakeP123Client:
         return {"code": 0, "data": {"InfoList": children, "Next": "-1"}}
 
     def fs_info(self, file_id):
-        e = self.entries.get(file_id)
+        self.fs_info_calls.append(file_id)
+        if isinstance(file_id, dict):
+            ids = file_id.get("fileIdList") or []
+            file_id = (ids[0] or {}).get("FileId") if ids else 0
+        e = self.entries.get(int(file_id or 0))
         if not e:
             return {"code": 1, "message": "not found"}
         return {"code": 0, "data": {"infoList": [e]}}

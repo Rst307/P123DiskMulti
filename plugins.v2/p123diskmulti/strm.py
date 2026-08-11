@@ -132,6 +132,7 @@ class StrmHelper:
         md5: str,
         s3_key_flag: str,
         disk_name: str = "",
+        file_id="",
     ) -> Optional[str]:
         """
         构建 STRM 播放 URL（302 端点地址 + 文件参数）
@@ -141,6 +142,7 @@ class StrmHelper:
         :param md5: 文件 MD5（Etag）
         :param s3_key_flag: 123 文件标识
         :param disk_name: 所在网盘名称（用于 302 时优先使用该盘账号换取，可选）
+        :param file_id: 123 FileId（按需分享一次 fs_info 直达；旧 STRM 可不带）
         :return: STRM URL，未配置 MoviePilot 地址时返回 None
         """
         if not self._moviepilot_address:
@@ -158,6 +160,8 @@ class StrmHelper:
         )
         if disk_name:
             url += f"&disk={quote(disk_name)}"
+        if file_id:
+            url += f"&file_id={quote(str(file_id))}"
         return url
 
     def resolve_download_url(
@@ -168,6 +172,7 @@ class StrmHelper:
         s3_key_flag: str,
         user_agent: str = "",
         disk_name: str = "",
+        file_id="",
     ) -> Optional[str]:
         """
         换取 123 实时下载地址（302 端点核心）
@@ -226,6 +231,8 @@ class StrmHelper:
                         if self._ticket_mode == "auto"
                         else 0.0
                     ),
+                    file_id=file_id,
+                    s3_key_flag=s3_key_flag,
                 )
                 if url:
                     return url
@@ -494,6 +501,7 @@ class StrmHelper:
                         md5=info["md5"],
                         s3_key_flag=info["s3_key_flag"],
                         disk_name=self._disk_of(item.path),
+                        file_id=info.get("file_id", ""),
                     )
                     if not url:
                         result["fail"] += 1
@@ -663,6 +671,7 @@ class StrmHelper:
             md5=info["md5"],
             s3_key_flag=info["s3_key_flag"],
             disk_name=self._disk_of(target_path),
+            file_id=info.get("file_id", ""),
         )
         if not url:
             return None
@@ -768,7 +777,7 @@ class StrmHelper:
         """
         从 FileItem.pickcode 提取 123 原始文件信息
 
-        :return: {"name", "size", "md5", "s3_key_flag"}，缺失返回 None
+        :return: {"name", "size", "md5", "s3_key_flag", "file_id"}，缺失返回 None
         """
         if not fileitem or not fileitem.pickcode:
             return None
@@ -789,6 +798,7 @@ class StrmHelper:
             "size": int(size),
             "md5": md5,
             "s3_key_flag": s3_key_flag,
+            "file_id": data.get("FileId") or getattr(fileitem, "fileid", "") or "",
         }
 
     @classmethod
