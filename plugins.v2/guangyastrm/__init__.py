@@ -17,7 +17,7 @@ from urllib.parse import quote, urlencode
 from apscheduler.triggers.date import DateTrigger
 from apscheduler.triggers.interval import IntervalTrigger
 from fastapi import Request
-from starlette.responses import JSONResponse, Response, StreamingResponse
+from starlette.responses import JSONResponse, RedirectResponse, Response
 
 from app.core.plugin import PluginManager
 from app.log import logger
@@ -28,7 +28,7 @@ class GuangYaStrm(_PluginBase):
     plugin_name = "光鸭 STRM"
     plugin_desc = "无需挂载光鸭云盘，直接扫描远程目录生成 STRM，并复用光鸭插件流式播放。"
     plugin_icon = "Moviepilot_A.png"
-    plugin_version = "1.0.1"
+    plugin_version = "1.0.2"
     plugin_author = "Rst307"
     author_url = "https://github.com/Rst307/P123DiskMulti"
     plugin_config_prefix = "guangyastrm_"
@@ -315,6 +315,10 @@ class GuangYaStrm(_PluginBase):
         return result
 
     def play(self, request: Request, path: str = "", sig: str = "") -> Response:
+        """
+        播放入口只负责鉴权、换取一次性光鸭签名地址并 302 跳转。
+        视频主体不会经过 MoviePilot 进程。
+        """
         try:
             remote_path = self._normalize_remote(path)
         except ValueError:
@@ -331,13 +335,7 @@ class GuangYaStrm(_PluginBase):
         if not plugin:
             return JSONResponse({"error": error or "source plugin unavailable"}, status_code=503)
 
-        # 不直接调用 ShukGuangYaDisk.stream_file()：
-        # 上游 V2 当前会把中文文件名原样写进 Content-Disposition，
-        # Starlette 构造响应头时按 latin-1 编码，从而导致中文文件名播放 500。
-        # 这里复用光鸭插件的登录态/API 客户端，但自行做一个无中文响应头的流式代理。
         try:
-            import requests as http_requests
-
             api = getattr(plugin, "_guangya_api", None)
             client = getattr(plugin, "_client", None)
             if not api or not client:
@@ -347,6 +345,21 @@ class GuangYaStrm(_PluginBase):
             if not file_item or getattr(file_item, "type", None) != "file":
                 return JSONResponse({"error": "file not found"}, status_code=404)
 
+            # Emby 常先做 HEAD 探测。这里直接用光鸭元数据回答，
+            # 避免为了 HEAD 再让 MoviePilot 去读取任何媒体内容。
+            if request.method.upper() == "HEAD":
+                headers = {
+                    "Accept-Ranges": "bytes",
+                    "Cache-Control": "no-store",
+                    "X-GuangYa-Playback": "direct-302",
+                }
+                size = int(getattr(file_item, "size", 0) or 0)
+                if size > 0:
+                    headers["Content-Length"] = str(size)
+                return Response(status_code=200, headers=headers)
+
+            # GET 时只向光鸭 API 请求一个短期 signedURL，然后立即 302。
+            # Emby 随后直接访问 signedURL，MoviePilot 不再代理视频数据。
             dl_response = client.get_download_url(file_item.fileid)
             if not isinstance(dl_response, dict):
                 return JSONResponse({"error": "invalid download response"}, status_code=502)
@@ -361,82 +374,18 @@ class GuangYaStrm(_PluginBase):
             if not download_url:
                 return JSONResponse({"error": "missing download url"}, status_code=502)
 
-            forward_headers = {
-                "User-Agent": request.headers.get(
-                    "user-agent",
-                    "Mozilla/5.0 (compatible; Emby/1.0; GuangYaStrmProxy)",
-                ),
-                "Referer": "https://www.guangyupan.com/",
-            }
-            range_header = request.headers.get("range")
-            if range_header:
-                forward_headers["Range"] = range_header
-
-            upstream_method = "HEAD" if request.method.upper() == "HEAD" else "GET"
-            upstream = http_requests.request(
-                upstream_method,
-                download_url,
-                headers=forward_headers,
-                stream=(upstream_method == "GET"),
-                timeout=300,
-                allow_redirects=True,
-            )
-            if upstream.status_code >= 400:
-                upstream.close()
-                return JSONResponse(
-                    {"error": f"upstream http {upstream.status_code}"},
-                    status_code=upstream.status_code,
-                )
-
-            response_headers = {
-                "Accept-Ranges": upstream.headers.get("accept-ranges", "bytes"),
-                "Cache-Control": "public, max-age=3600",
-            }
-            for source_name, target_name in (
-                ("content-length", "Content-Length"),
-                ("content-range", "Content-Range"),
-                ("etag", "ETag"),
-                ("last-modified", "Last-Modified"),
-            ):
-                value = upstream.headers.get(source_name)
-                if value:
-                    response_headers[target_name] = value
-
-            # 中文文件名必须使用 RFC 5987 百分号编码，不能直接塞进 latin-1 响应头。
-            filename = getattr(file_item, "name", "") or PurePosixPath(remote_path).name
-            if filename:
-                response_headers["Content-Disposition"] = (
-                    "inline; filename*=UTF-8''" + quote(filename, safe="")
-                )
-
-            content_type = upstream.headers.get("content-type", "application/octet-stream")
-            if upstream_method == "HEAD":
-                upstream.close()
-                return Response(
-                    status_code=upstream.status_code,
-                    headers=response_headers,
-                    media_type=content_type,
-                )
-
-            def generate():
-                try:
-                    for chunk in upstream.iter_content(chunk_size=1024 * 256):
-                        if chunk:
-                            yield chunk
-                except Exception as exc:
-                    logger.warning("【光鸭 STRM】流式传输中断: %s", exc)
-                finally:
-                    upstream.close()
-
-            return StreamingResponse(
-                generate(),
-                status_code=upstream.status_code,
-                headers=response_headers,
-                media_type=content_type,
+            logger.info("【光鸭 STRM】302 直链播放: %s", remote_path)
+            return RedirectResponse(
+                url=str(download_url),
+                status_code=302,
+                headers={
+                    "Cache-Control": "no-store",
+                    "X-GuangYa-Playback": "direct-302",
+                },
             )
         except Exception as exc:
-            logger.error("【光鸭 STRM】播放桥接失败 %s：%s", remote_path, exc)
-            return JSONResponse({"error": "stream bridge failed"}, status_code=502)
+            logger.error("【光鸭 STRM】302 换链失败 %s：%s", remote_path, exc)
+            return JSONResponse({"error": "redirect failed"}, status_code=502)
 
     def status(self) -> Dict[str, Any]:
         plugin, error = self._source_plugin()
@@ -523,7 +472,7 @@ class GuangYaStrm(_PluginBase):
                         "component": "VAlert",
                         "props": {
                             "type": "info", "variant": "tonal",
-                            "text": "依赖已经登录的光鸭云盘助手。不下载媒体主体，只生成 STRM；当前播放数据会经过 MoviePilot 转发。",
+                            "text": "依赖已经登录的光鸭云盘助手。不下载媒体主体，只生成 STRM；播放时 MoviePilot 仅换取签名地址并返回 302，视频主体直接从光鸭/CDN 读取。",
                         },
                     },
                     {"component": "VTextField", "props": {"model": "source_plugin_id", "label": "光鸭插件 ID", "placeholder": "ShukGuangYaDisk"}},
@@ -582,7 +531,7 @@ class GuangYaStrm(_PluginBase):
                 "component": "VAlert",
                 "props": {
                     "type": "warning", "variant": "tonal",
-                    "text": "v1.0.0 播放数据由 MoviePilot 转发，不占本地影视存储，但会占用 MoviePilot 服务器带宽。",
+                    "text": "v1.0.2 已切换为 302 直链：MoviePilot 只处理很小的换链请求，视频主体不经过 MoviePilot。",
                 },
             },
         ]
