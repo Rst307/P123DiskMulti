@@ -12,12 +12,12 @@ import threading
 from datetime import datetime, timedelta
 from pathlib import Path, PurePosixPath
 from typing import Any, Dict, Iterable, List, Optional, Tuple
-from urllib.parse import urlencode
+from urllib.parse import quote, urlencode
 
 from apscheduler.triggers.date import DateTrigger
 from apscheduler.triggers.interval import IntervalTrigger
 from fastapi import Request
-from starlette.responses import JSONResponse, Response
+from starlette.responses import JSONResponse, Response, StreamingResponse
 
 from app.core.plugin import PluginManager
 from app.log import logger
@@ -28,7 +28,7 @@ class GuangYaStrm(_PluginBase):
     plugin_name = "光鸭 STRM"
     plugin_desc = "无需挂载光鸭云盘，直接扫描远程目录生成 STRM，并复用光鸭插件流式播放。"
     plugin_icon = "Moviepilot_A.png"
-    plugin_version = "1.0.0"
+    plugin_version = "1.0.1"
     plugin_author = "Rst307"
     author_url = "https://github.com/Rst307/P123DiskMulti"
     plugin_config_prefix = "guangyastrm_"
@@ -330,8 +330,110 @@ class GuangYaStrm(_PluginBase):
         plugin, error = self._source_plugin()
         if not plugin:
             return JSONResponse({"error": error or "source plugin unavailable"}, status_code=503)
+
+        # 不直接调用 ShukGuangYaDisk.stream_file()：
+        # 上游 V2 当前会把中文文件名原样写进 Content-Disposition，
+        # Starlette 构造响应头时按 latin-1 编码，从而导致中文文件名播放 500。
+        # 这里复用光鸭插件的登录态/API 客户端，但自行做一个无中文响应头的流式代理。
         try:
-            return plugin.stream_file(request, remote_path)
+            import requests as http_requests
+
+            api = getattr(plugin, "_guangya_api", None)
+            client = getattr(plugin, "_client", None)
+            if not api or not client:
+                return JSONResponse({"error": "source plugin client unavailable"}, status_code=503)
+
+            file_item = api.get_item(Path(remote_path))
+            if not file_item or getattr(file_item, "type", None) != "file":
+                return JSONResponse({"error": "file not found"}, status_code=404)
+
+            dl_response = client.get_download_url(file_item.fileid)
+            if not isinstance(dl_response, dict):
+                return JSONResponse({"error": "invalid download response"}, status_code=502)
+            if dl_response.get("msg") != "success" and dl_response.get("code") != 0:
+                return JSONResponse(
+                    {"error": f"get download url failed: {dl_response.get('msg', 'unknown')}"},
+                    status_code=502,
+                )
+
+            data = dl_response.get("data") or {}
+            download_url = data.get("signedURL") or data.get("downloadUrl")
+            if not download_url:
+                return JSONResponse({"error": "missing download url"}, status_code=502)
+
+            forward_headers = {
+                "User-Agent": request.headers.get(
+                    "user-agent",
+                    "Mozilla/5.0 (compatible; Emby/1.0; GuangYaStrmProxy)",
+                ),
+                "Referer": "https://www.guangyupan.com/",
+            }
+            range_header = request.headers.get("range")
+            if range_header:
+                forward_headers["Range"] = range_header
+
+            upstream_method = "HEAD" if request.method.upper() == "HEAD" else "GET"
+            upstream = http_requests.request(
+                upstream_method,
+                download_url,
+                headers=forward_headers,
+                stream=(upstream_method == "GET"),
+                timeout=300,
+                allow_redirects=True,
+            )
+            if upstream.status_code >= 400:
+                upstream.close()
+                return JSONResponse(
+                    {"error": f"upstream http {upstream.status_code}"},
+                    status_code=upstream.status_code,
+                )
+
+            response_headers = {
+                "Accept-Ranges": upstream.headers.get("accept-ranges", "bytes"),
+                "Cache-Control": "public, max-age=3600",
+            }
+            for source_name, target_name in (
+                ("content-length", "Content-Length"),
+                ("content-range", "Content-Range"),
+                ("etag", "ETag"),
+                ("last-modified", "Last-Modified"),
+            ):
+                value = upstream.headers.get(source_name)
+                if value:
+                    response_headers[target_name] = value
+
+            # 中文文件名必须使用 RFC 5987 百分号编码，不能直接塞进 latin-1 响应头。
+            filename = getattr(file_item, "name", "") or PurePosixPath(remote_path).name
+            if filename:
+                response_headers["Content-Disposition"] = (
+                    "inline; filename*=UTF-8''" + quote(filename, safe="")
+                )
+
+            content_type = upstream.headers.get("content-type", "application/octet-stream")
+            if upstream_method == "HEAD":
+                upstream.close()
+                return Response(
+                    status_code=upstream.status_code,
+                    headers=response_headers,
+                    media_type=content_type,
+                )
+
+            def generate():
+                try:
+                    for chunk in upstream.iter_content(chunk_size=1024 * 256):
+                        if chunk:
+                            yield chunk
+                except Exception as exc:
+                    logger.warning("【光鸭 STRM】流式传输中断: %s", exc)
+                finally:
+                    upstream.close()
+
+            return StreamingResponse(
+                generate(),
+                status_code=upstream.status_code,
+                headers=response_headers,
+                media_type=content_type,
+            )
         except Exception as exc:
             logger.error("【光鸭 STRM】播放桥接失败 %s：%s", remote_path, exc)
             return JSONResponse({"error": "stream bridge failed"}, status_code=502)
@@ -358,7 +460,7 @@ class GuangYaStrm(_PluginBase):
             {
                 "path": "/play",
                 "endpoint": self.play,
-                "methods": ["GET"],
+                "methods": ["GET", "HEAD"],
                 "allow_anonymous": True,
                 "summary": "光鸭 STRM 播放桥接",
             },
