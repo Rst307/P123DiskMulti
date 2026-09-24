@@ -39,5 +39,18 @@
       "v1.1.0": "新增多盘 STRM 功能：302直链播放、整理入库自动生成、全量/定时同步（所有网盘通用）",
       "v1.0.0": "发布"
     }
+  },
+  "GuangYaStrm": {
+    "name": "光鸭 STRM",
+    "description": "MoviePilot V2 光鸭 STRM 助手：无需本地挂载，直接扫描光鸭云盘助手远程目录生成 STRM，并提供带单文件签名的 Emby 播放桥接。",
+    "labels": "光鸭云盘,STRM,Emby,云盘",
+    "version": "1.0.0",
+    "icon": "Moviepilot_A.png",
+    "author": "Rst307",
+    "level": 1,
+    "history": {
+      "v1.0.0": "首个 V2 版本：直接读取 ShukGuangYaDisk 的远程 /emby 目录，无需 rclone/CloudDrive2/WebDAV 挂载；生成 STRM；支持 HMAC 单文件播放签名、Range 流式桥接、定时同步和失效 STRM 清理。"
+    },
+    "v3": false
   }
 }
