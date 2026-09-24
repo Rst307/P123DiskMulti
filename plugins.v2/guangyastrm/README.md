@@ -16,10 +16,10 @@ GuangYaStrm
 Emby
        ↓
 GuangYaStrm /play
+       ↓ 仅换取 signedURL
+302 Redirect
        ↓
-ShukGuangYaDisk.stream_file()
-       ↓
-光鸭云盘
+光鸭 / CDN
 ```
 
 不会把影片主体下载到服务器，本地只保存很小的 `.strm` 和索引文件。
@@ -82,16 +82,22 @@ V2 当前宿主支持插件 API 的 `allow_anonymous`。本插件的播放端点
 
 因此 STRM 中不会保存 MoviePilot 管理员 Token。
 
-## 当前限制
+## v1.0.2 播放链路
 
-v1.0.0 采用兼容优先方案：实际媒体数据会经过 MoviePilot 转发。
+v1.0.2 已切换为 302 直链。
 
-也就是说：
+播放时 MoviePilot 只做两件事：
+
+1. 校验 STRM 中的单文件 HMAC 签名；
+2. 向光鸭 API 换取短期 signedURL，并向 Emby 返回 HTTP 302。
+
+之后媒体数据由 Emby 直接访问光鸭/CDN，不再经过 MoviePilot 进程。
+
+因此：
 
 - 不占本地影视存储
 - 不需要 rclone
 - 不需要 CloudDrive2
 - 不需要 WebDAV mount
-- 但播放会占用 MoviePilot 所在服务器的网络带宽
-
-后续可再增加 302 直链模式。
+- MoviePilot 只承担很小的 API/换链流量
+- 视频主体流量走光鸭/CDN → Emby
