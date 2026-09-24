@@ -1,0 +1,15 @@
+{
+  "GuangYaStrm": {
+    "name": "光鸭 STRM",
+    "description": "无需挂载光鸭云盘，直接读取光鸭云盘助手的远程目录生成 STRM，并提供带单文件签名的 Emby 流式桥接。",
+    "labels": "光鸭云盘,STRM,Emby,云盘",
+    "version": "1.0.0",
+    "icon": "Moviepilot_A.png",
+    "author": "Rst307",
+    "level": 1,
+    "system_version": ">=3.0.0",
+    "history": {
+      "v1.0.0": "首个版本：直接扫描 ShukGuangYaDisk 的远程目录，无需 rclone/CloudDrive2 挂载；生成 STRM；支持 Range 播放桥接、定时同步、失效 STRM 清理和单文件 HMAC 播放签名。"
+    }
+  }
+}
