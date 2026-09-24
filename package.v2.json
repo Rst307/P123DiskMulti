@@ -44,11 +44,12 @@
     "name": "光鸭 STRM",
     "description": "MoviePilot V2 光鸭 STRM 助手：无需本地挂载，直接扫描光鸭云盘助手远程目录生成 STRM，并提供带单文件签名的 Emby 播放桥接。",
     "labels": "光鸭云盘,STRM,Emby,云盘",
-    "version": "1.0.1",
+    "version": "1.0.2",
     "icon": "Moviepilot_A.png",
     "author": "Rst307",
     "level": 1,
     "history": {
+      "v1.0.2": "播放链路改为真正 302 直链：MoviePilot 只校验 STRM 签名、向光鸭 API 换取短期 signedURL 并返回 302；媒体主体由 Emby 直接读取光鸭/CDN，不再经过 MoviePilot 流式代理。HEAD 探测直接用远端元数据响应。",
       "v1.0.1": "修复中文媒体文件名播放时报 latin-1 编码错误：不再直接复用上游含原始中文 Content-Disposition 的 stream_file 响应，改为复用光鸭登录态/签名下载接口并自行流式转发；Content-Disposition 使用 RFC 5987 UTF-8 百分号编码，同时补充 HEAD 支持。",
       "v1.0.0": "首个 V2 版本：直接读取 ShukGuangYaDisk 的远程 /emby 目录，无需 rclone/CloudDrive2/WebDAV 挂载；生成 STRM；支持 HMAC 单文件播放签名、Range 流式桥接、定时同步和失效 STRM 清理。"
     },
