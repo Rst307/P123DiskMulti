@@ -168,3 +168,52 @@ GET  /api/v1/plugin/GuangYaStrm/organize/status
 ```
 
 这两个管理接口需要 MoviePilot Bearer 登录认证。
+
+
+## 整理联动与立即操作（v1.2.0）
+
+新增配置：
+
+```text
+整理完成后自动生成 STRM：开启/关闭
+```
+
+开启后，插件不会在“提交整理任务”时立刻生成 STRM，而是监听 MoviePilot 的 `TransferComplete` 事件。只有在 MoviePilot 真正完成整理，并且：
+
+- 来源文件位于本插件配置的“待整理光鸭目录”；
+- 目标存储仍然是“光鸭云盘助手”；
+- 目标文件位于 STRM 媒体根目录（默认 `/emby`）；
+
+才会立即生成该目标文件对应的 STRM。
+
+典型流程：
+
+```text
+/emby_raw/乱文件.mkv
+        ↓
+立即整理 / Cron 自动整理
+        ↓
+MoviePilot 原生整理链
+        ↓
+光鸭云端移动到 /emby/...
+        ↓ TransferComplete
+GuangYaStrm 自动生成单文件 STRM
+        ↓
+/opt/emby/strm/光鸭云盘/...
+```
+
+插件详情页新增两个操作：
+
+- **立即整理**：立即扫描“待整理光鸭目录”并后台提交到 MoviePilot 整理队列。这个手动操作即使没有开启 Cron 自动整理也可以使用。
+- **立即生成 STRM**：立即后台完整扫描 STRM 媒体根目录并生成/更新 STRM，同时按配置清理失效 STRM。
+
+管理 API：
+
+```text
+GET  /api/v1/plugin/GuangYaStrm/action/organize
+GET  /api/v1/plugin/GuangYaStrm/action/sync
+POST /api/v1/plugin/GuangYaStrm/organize/run
+POST /api/v1/plugin/GuangYaStrm/sync
+```
+
+这些管理接口均需要 MoviePilot 登录认证。
