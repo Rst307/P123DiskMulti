@@ -20,16 +20,18 @@ from apscheduler.triggers.interval import IntervalTrigger
 from fastapi import Request
 from starlette.responses import JSONResponse, RedirectResponse, Response
 
+from app.core.event import Event, eventmanager
 from app.core.plugin import PluginManager
 from app.log import logger
 from app.plugins import _PluginBase
+from app.schemas.types import EventType
 
 
 class GuangYaStrm(_PluginBase):
     plugin_name = "光鸭 STRM"
     plugin_desc = "无需挂载光鸭云盘，直接扫描远程目录生成 STRM，并复用光鸭插件流式播放。"
     plugin_icon = "Moviepilot_A.png"
-    plugin_version = "1.1.0"
+    plugin_version = "1.2.0"
     plugin_author = "Rst307"
     author_url = "https://github.com/Rst307/P123DiskMulti"
     plugin_config_prefix = "guangyastrm_"
@@ -55,6 +57,7 @@ class GuangYaStrm(_PluginBase):
     _organize_paths = ""
     _organize_cron = "*/10 * * * *"
     _organize_skip_bluray = True
+    _organize_auto_strm = True
 
     def init_plugin(self, config: dict = None):
         config = config or {}
@@ -77,6 +80,7 @@ class GuangYaStrm(_PluginBase):
         self._organize_paths = str(config.get("organize_paths") or "")
         self._organize_cron = str(config.get("organize_cron") or "*/10 * * * *").strip()
         self._organize_skip_bluray = bool(config.get("organize_skip_bluray", True))
+        self._organize_auto_strm = bool(config.get("organize_auto_strm", True))
 
         self._sync_lock = threading.Lock()
         if not hasattr(self, "_organize_lock"):
@@ -87,6 +91,8 @@ class GuangYaStrm(_PluginBase):
             self._organize_last_time = None
         if not hasattr(self, "_organize_last_result"):
             self._organize_last_result = None
+        if not hasattr(self, "_last_auto_strm"):
+            self._last_auto_strm = None
 
         self._last_status = {
             "success": None, "message": "等待同步", "last_sync": None,
@@ -163,6 +169,7 @@ class GuangYaStrm(_PluginBase):
             "organize_paths": self._organize_paths,
             "organize_cron": self._organize_cron,
             "organize_skip_bluray": self._organize_skip_bluray,
+            "organize_auto_strm": self._organize_auto_strm,
         })
 
     @property
