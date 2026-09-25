@@ -42,13 +42,14 @@
   },
   "GuangYaStrm": {
     "name": "光鸭 STRM",
-    "description": "MoviePilot V2 光鸭 STRM + 自动整理助手：无需本地挂载，302 直链播放，并可递归扫描光鸭待整理目录提交到 MoviePilot 原生整理链。",
+    "description": "MoviePilot V2 光鸭 STRM + 自动整理助手：302 直链播放、远端目录自动整理、整理完成自动生成 STRM，并提供立即整理/立即生成 STRM 操作。",
     "labels": "光鸭云盘,STRM,Emby,云盘",
-    "version": "1.1.0",
+    "version": "1.2.0",
     "icon": "Moviepilot_A.png",
     "author": "Rst307",
     "level": 1,
     "history": {
+      "v1.2.0": "新增整理联动与即时操作：可选择“整理完成后自动生成 STRM”，监听 MoviePilot TransferComplete，确认真实整理完成且目标位于光鸭媒体根目录后立即生成单文件 STRM；新增“立即整理”和“立即生成 STRM”按钮/API，手动整理不再要求开启 Cron 自动整理。",
       "v1.1.0": "新增光鸭远端目录自动整理：可配置多个待整理目录与 Cron，递归扫描媒体文件并调用 MoviePilot TransferChain.manual_transfer(background=True)；识别、重命名、目标目录、冲突处理与刮削全部遵循 MoviePilot 原生整理规则，实际云端 move/copy 复用光鸭云盘助手存储适配器。支持保存后立即整理、手动 API 与状态查看。",
       "v1.0.2": "播放链路改为真正 302 直链：MoviePilot 只校验 STRM 签名、向光鸭 API 换取短期 signedURL 并返回 302；媒体主体由 Emby 直接读取光鸭/CDN，不再经过 MoviePilot 流式代理。HEAD 探测直接用远端元数据响应。",
       "v1.0.1": "修复中文媒体文件名播放时报 latin-1 编码错误：不再直接复用上游含原始中文 Content-Disposition 的 stream_file 响应，改为复用光鸭登录态/签名下载接口并自行流式转发；Content-Disposition 使用 RFC 5987 UTF-8 百分号编码，同时补充 HEAD 支持。",
