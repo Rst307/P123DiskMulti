@@ -14,6 +14,7 @@ from pathlib import Path, PurePosixPath
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 from urllib.parse import quote, urlencode
 
+from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.date import DateTrigger
 from apscheduler.triggers.interval import IntervalTrigger
 from fastapi import Request
@@ -28,7 +29,7 @@ class GuangYaStrm(_PluginBase):
     plugin_name = "光鸭 STRM"
     plugin_desc = "无需挂载光鸭云盘，直接扫描远程目录生成 STRM，并复用光鸭插件流式播放。"
     plugin_icon = "Moviepilot_A.png"
-    plugin_version = "1.0.2"
+    plugin_version = "1.1.0"
     plugin_author = "Rst307"
     author_url = "https://github.com/Rst307/P123DiskMulti"
     plugin_config_prefix = "guangyastrm_"
@@ -46,6 +47,15 @@ class GuangYaStrm(_PluginBase):
     _stream_secret = ""
     _video_extensions_raw = ".mkv,.mp4,.avi,.mov,.wmv,.flv,.ts,.m2ts,.webm,.iso,.mpg,.mpeg"
 
+    # 自动整理：扫描光鸭远端“待整理目录”，提交给 MoviePilot 原生整理链。
+    # 最终目标目录由 MoviePilot 的存储/整理目录规则决定，例如：
+    # 光鸭云盘助手:/emby_raw -> 光鸭云盘助手:/emby
+    _organize_enabled = False
+    _organize_onlyonce = False
+    _organize_paths = ""
+    _organize_cron = "*/10 * * * *"
+    _organize_skip_bluray = True
+
     def init_plugin(self, config: dict = None):
         config = config or {}
         self._enabled = bool(config.get("enabled", False))
@@ -61,7 +71,23 @@ class GuangYaStrm(_PluginBase):
             or ".mkv,.mp4,.avi,.mov,.wmv,.flv,.ts,.m2ts,.webm,.iso,.mpg,.mpeg"
         )
         self._stream_secret = str(config.get("stream_secret") or "").strip() or secrets.token_urlsafe(32)
+
+        self._organize_enabled = bool(config.get("organize_enabled", False))
+        self._organize_onlyonce = bool(config.get("organize_onlyonce", False))
+        self._organize_paths = str(config.get("organize_paths") or "")
+        self._organize_cron = str(config.get("organize_cron") or "*/10 * * * *").strip()
+        self._organize_skip_bluray = bool(config.get("organize_skip_bluray", True))
+
         self._sync_lock = threading.Lock()
+        if not hasattr(self, "_organize_lock"):
+            self._organize_lock = threading.Lock()
+        if not hasattr(self, "_organize_running"):
+            self._organize_running = False
+        if not hasattr(self, "_organize_last_time"):
+            self._organize_last_time = None
+        if not hasattr(self, "_organize_last_result"):
+            self._organize_last_result = None
+
         self._last_status = {
             "success": None, "message": "等待同步", "last_sync": None,
             "files": 0, "created": 0, "updated": 0, "deleted": 0,
@@ -132,6 +158,11 @@ class GuangYaStrm(_PluginBase):
             "cleanup_stale": self._cleanup_stale,
             "stream_secret": self._stream_secret,
             "video_extensions": self._video_extensions_raw,
+            "organize_enabled": self._organize_enabled,
+            "organize_onlyonce": self._organize_onlyonce if onlyonce is None else False,
+            "organize_paths": self._organize_paths,
+            "organize_cron": self._organize_cron,
+            "organize_skip_bluray": self._organize_skip_bluray,
         })
 
     @property
@@ -314,6 +345,186 @@ class GuangYaStrm(_PluginBase):
         self._save_config(onlyonce=False)
         return result
 
+    def _organize_path_list(self) -> List[str]:
+        """解析待整理光鸭目录，每行一个远端路径。"""
+        result = []
+        seen = set()
+        for raw in (self._organize_paths or "").splitlines():
+            line = raw.strip()
+            if not line or line.startswith("#"):
+                continue
+            try:
+                path = self._normalize_remote(line)
+            except ValueError:
+                logger.warning("【光鸭 STRM】【自动整理】忽略非法目录: %s", line)
+                continue
+            if path not in seen:
+                result.append(path)
+                seen.add(path)
+        return result
+
+    def _walk_organize_media(self, api: Any, dir_item: Any) -> Iterable[Any]:
+        """递归遍历光鸭目录，只产出 MoviePilot 可整理的视频 FileItem。"""
+        try:
+            children = api.list(dir_item) or []
+        except Exception as exc:
+            logger.warning(
+                "【光鸭 STRM】【自动整理】遍历目录失败 %s: %s",
+                getattr(dir_item, "path", ""),
+                exc,
+            )
+            return
+
+        extensions = self._extensions()
+        for child in children:
+            if getattr(child, "type", None) == "dir":
+                if (
+                    self._organize_skip_bluray
+                    and str(getattr(child, "name", "")).upper() in {"BDMV", "CERTIFICATE"}
+                ):
+                    continue
+                yield from self._walk_organize_media(api, child)
+                continue
+
+            name = str(getattr(child, "name", "") or "")
+            if PurePosixPath(name).suffix.casefold() in extensions:
+                yield child
+
+    @staticmethod
+    def _submit_to_moviepilot(fileitem: Any) -> Tuple[bool, str]:
+        """
+        使用 MoviePilot 原生整理链提交文件。
+        识别、重命名、目标目录、冲突处理、刮削等均遵循 MoviePilot 配置；
+        光鸭插件的 StorageOperSelection 负责实际云端 move/copy。
+        """
+        try:
+            from app.chain.transfer import TransferChain
+
+            state, message = TransferChain().manual_transfer(
+                fileitem=fileitem,
+                background=True,
+            )
+            return bool(state), str(message or "")
+        except Exception as exc:
+            return False, f"整理链调用异常: {exc}"
+
+    def _organize_worker(self):
+        self._organize_running = True
+        self._organize_last_time = datetime.now().astimezone().isoformat(timespec="seconds")
+        result = {
+            "success": True,
+            "submitted": 0,
+            "failed": 0,
+            "scanned": 0,
+            "paths": [],
+            "errors": [],
+        }
+        try:
+            plugin, error = self._source_plugin()
+            if not plugin:
+                raise RuntimeError(error or "光鸭云盘助手不可用")
+            api = getattr(plugin, "_guangya_api", None)
+            if not api:
+                raise RuntimeError("光鸭云盘助手存储 API 不可用")
+
+            paths = self._organize_path_list()
+            if not paths:
+                raise RuntimeError("未配置待整理光鸭目录")
+
+            seen = set()
+            for path in paths:
+                dir_item = api.get_item(Path(path))
+                if not dir_item or getattr(dir_item, "type", None) != "dir":
+                    result["failed"] += 1
+                    result["errors"].append(f"目录不存在或不是文件夹: {path}")
+                    logger.warning("【光鸭 STRM】【自动整理】跳过无效目录: %s", path)
+                    continue
+
+                result["paths"].append(path)
+                logger.info("【光鸭 STRM】【自动整理】开始扫描: %s", path)
+                for fileitem in self._walk_organize_media(api, dir_item):
+                    file_path = str(getattr(fileitem, "path", "") or "")
+                    identity = (
+                        getattr(fileitem, "fileid", None)
+                        or getattr(fileitem, "id", None)
+                        or file_path
+                    )
+                    if identity in seen:
+                        continue
+                    seen.add(identity)
+                    result["scanned"] += 1
+
+                    # 防止因第三方 FileItem 构造异常导致 MoviePilot 无法选中光鸭存储。
+                    if not getattr(fileitem, "storage", None):
+                        try:
+                            fileitem.storage = getattr(plugin, "_disk_name", "光鸭云盘助手")
+                        except Exception:
+                            pass
+
+                    ok, message = self._submit_to_moviepilot(fileitem)
+                    if ok:
+                        result["submitted"] += 1
+                        logger.info("【光鸭 STRM】【自动整理】已提交: %s", file_path)
+                    else:
+                        result["failed"] += 1
+                        detail = f"{file_path}: {message}"
+                        result["errors"].append(detail)
+                        logger.warning("【光鸭 STRM】【自动整理】提交失败: %s", detail)
+
+            result["success"] = result["failed"] == 0 or result["submitted"] > 0
+            result["message"] = (
+                f"扫描 {result['scanned']} 个媒体，提交 {result['submitted']} 个，"
+                f"失败 {result['failed']} 个"
+            )
+            logger.info("【光鸭 STRM】【自动整理】%s", result["message"])
+        except Exception as exc:
+            result["success"] = False
+            result["message"] = str(exc)
+            result["errors"].append(str(exc))
+            logger.error("【光鸭 STRM】【自动整理】执行失败: %s", exc)
+        finally:
+            result["finished_at"] = datetime.now().astimezone().isoformat(timespec="seconds")
+            self._organize_last_result = result
+            self._organize_running = False
+            self._organize_lock.release()
+
+    def start_organize(self) -> Dict[str, Any]:
+        """后台启动一次远端目录整理扫描，非重入。"""
+        if not self._organize_enabled:
+            return {"success": False, "message": "自动整理未启用"}
+        if not self._organize_path_list():
+            return {"success": False, "message": "未配置待整理光鸭目录"}
+        if not self._organize_lock.acquire(blocking=False):
+            return {"success": False, "message": "已有自动整理任务正在运行"}
+        threading.Thread(
+            target=self._organize_worker,
+            daemon=True,
+            name="GuangYaStrmOrganize",
+        ).start()
+        return {
+            "success": True,
+            "background": True,
+            "message": "已开始后台扫描光鸭目录并提交到 MoviePilot 整理队列",
+        }
+
+    def organize_status(self) -> Dict[str, Any]:
+        return {
+            "success": True,
+            "enabled": self._organize_enabled,
+            "running": self._organize_running,
+            "paths": self._organize_path_list(),
+            "cron": self._organize_cron,
+            "last_time": self._organize_last_time,
+            "last_result": self._organize_last_result,
+        }
+
+    def _run_organize_once(self):
+        try:
+            return self.start_organize()
+        finally:
+            self._organize_onlyonce = False
+            self._save_config(onlyonce=False)
+
     def play(self, request: Request, path: str = "", sig: str = "") -> Response:
         """
         播放入口只负责鉴权、换取一次性光鸭签名地址并 302 跳转。
@@ -427,6 +638,20 @@ class GuangYaStrm(_PluginBase):
                 "auth": "bear",
                 "summary": "查看光鸭 STRM 状态",
             },
+            {
+                "path": "/organize/run",
+                "endpoint": self.start_organize,
+                "methods": ["POST"],
+                "auth": "bear",
+                "summary": "立即执行一次光鸭远端目录自动整理",
+            },
+            {
+                "path": "/organize/status",
+                "endpoint": self.organize_status,
+                "methods": ["GET"],
+                "auth": "bear",
+                "summary": "查看自动整理状态",
+            },
         ]
 
     def get_service(self) -> List[Dict[str, Any]]:
@@ -446,6 +671,32 @@ class GuangYaStrm(_PluginBase):
                 "name": "光鸭 STRM 立即同步",
                 "trigger": DateTrigger(run_date=datetime.now().astimezone() + timedelta(seconds=5)),
                 "func": self._run_once,
+                "kwargs": {},
+            })
+
+        if self._organize_enabled and self._organize_path_list() and self._organize_cron:
+            try:
+                organize_trigger = CronTrigger.from_crontab(self._organize_cron)
+                services.append({
+                    "id": f"{instance_id}.Organize",
+                    "name": "光鸭云盘自动整理",
+                    "trigger": organize_trigger,
+                    "func": self.start_organize,
+                    "kwargs": {},
+                })
+            except Exception as exc:
+                logger.error(
+                    "【光鸭 STRM】【自动整理】Cron 表达式无效 %s: %s",
+                    self._organize_cron,
+                    exc,
+                )
+
+        if self._organize_enabled and self._organize_onlyonce:
+            services.append({
+                "id": f"{instance_id}.OrganizeRunOnce",
+                "name": "光鸭云盘立即整理",
+                "trigger": DateTrigger(run_date=datetime.now().astimezone() + timedelta(seconds=8)),
+                "func": self._run_organize_once,
                 "kwargs": {},
             })
         return services
@@ -498,6 +749,49 @@ class GuangYaStrm(_PluginBase):
                             "persistentHint": True,
                         },
                     },
+                    {
+                        "component": "VAlert",
+                        "props": {
+                            "type": "info",
+                            "variant": "tonal",
+                            "text": "自动整理会递归扫描下面配置的光鸭远端目录，并把媒体文件提交给 MoviePilot 原生整理链。最终目标目录不在这里指定，而由 MoviePilot 的整理/存储目录配置决定。典型配置：/emby_raw → 光鸭云盘助手:/emby。",
+                        },
+                    },
+                    {
+                        "component": "VRow",
+                        "content": [
+                            {
+                                "component": "VCol", "props": {"cols": 12, "md": 6},
+                                "content": [{"component": "VSwitch", "props": {"model": "organize_enabled", "label": "启用光鸭云盘自动整理"}}],
+                            },
+                            {
+                                "component": "VCol", "props": {"cols": 12, "md": 6},
+                                "content": [{"component": "VSwitch", "props": {"model": "organize_onlyonce", "label": "保存后立即整理一次"}}],
+                            },
+                        ],
+                    },
+                    {
+                        "component": "VTextarea",
+                        "props": {
+                            "model": "organize_paths",
+                            "label": "待整理光鸭目录（每行一个）",
+                            "placeholder": "/emby_raw",
+                            "rows": 3,
+                            "hint": "这里填写源目录。整理后的目标由 MoviePilot 的整理规则决定。",
+                            "persistentHint": True,
+                        },
+                    },
+                    {
+                        "component": "VTextField",
+                        "props": {
+                            "model": "organize_cron",
+                            "label": "自动整理 Cron",
+                            "placeholder": "*/10 * * * *",
+                            "hint": "默认每 10 分钟扫描一次；成功整理后文件会被 MoviePilot 移出源目录。",
+                            "persistentHint": True,
+                        },
+                    },
+                    {"component": "VSwitch", "props": {"model": "organize_skip_bluray", "label": "跳过 BDMV/CERTIFICATE 原盘结构目录"}},
                 ],
             }
         ], {
@@ -511,6 +805,11 @@ class GuangYaStrm(_PluginBase):
             "cleanup_stale": True,
             "stream_secret": "",
             "video_extensions": ".mkv,.mp4,.avi,.mov,.wmv,.flv,.ts,.m2ts,.webm,.iso,.mpg,.mpeg",
+            "organize_enabled": False,
+            "organize_onlyonce": False,
+            "organize_paths": "",
+            "organize_cron": "*/10 * * * *",
+            "organize_skip_bluray": True,
         }
 
     def get_page(self) -> List[dict]:
@@ -525,13 +824,34 @@ class GuangYaStrm(_PluginBase):
             f"更新：{status.get('updated', 0)}，删除：{status.get('deleted', 0)}\n"
             f"光鸭插件：{'已就绪' if status.get('source_ready') else '未就绪'}"
         )
+        organize = self.organize_status()
+        organize_last = organize.get("last_result") or {}
+        organize_text = (
+            f"自动整理：{'运行中' if organize.get('running') else ('已启用' if organize.get('enabled') else '未启用')}\n"
+            f"待整理目录：{', '.join(organize.get('paths') or []) or '未配置'}\n"
+            f"最近执行：{organize.get('last_time') or '尚未执行'}"
+        )
+        if organize_last:
+            organize_text += (
+                f"\n扫描：{organize_last.get('scanned', 0)}，"
+                f"提交：{organize_last.get('submitted', 0)}，"
+                f"失败：{organize_last.get('failed', 0)}"
+            )
+
         return [
             {"component": "VAlert", "props": {"type": alert_type, "variant": "tonal", "text": text}},
             {
                 "component": "VAlert",
                 "props": {
-                    "type": "warning", "variant": "tonal",
-                    "text": "v1.0.2 已切换为 302 直链：MoviePilot 只处理很小的换链请求，视频主体不经过 MoviePilot。",
+                    "type": "success", "variant": "tonal",
+                    "text": "v1.1.0 使用 302 直链：MoviePilot 只处理换链请求，视频主体直接走光鸭/CDN。",
+                },
+            },
+            {
+                "component": "VAlert",
+                "props": {
+                    "type": "info", "variant": "tonal",
+                    "text": organize_text,
                 },
             },
         ]
