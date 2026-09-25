@@ -42,13 +42,14 @@
   },
   "GuangYaStrm": {
     "name": "光鸭 STRM",
-    "description": "MoviePilot V2 光鸭 STRM + 自动整理助手：302 直链播放、远端目录自动整理、整理完成自动生成 STRM，并提供立即整理/立即生成 STRM 操作。",
+    "description": "MoviePilot V2 光鸭 STRM + 自动整理助手：302 直链播放、远端自动整理、整理完成自动生成 STRM，并提供 Cloudflare Tunnel 外网 Emby 302 伴侣网关。",
     "labels": "光鸭云盘,STRM,Emby,云盘",
-    "version": "1.2.0",
+    "version": "1.3.0",
     "icon": "Moviepilot_A.png",
     "author": "Rst307",
     "level": 1,
     "history": {
+      "v1.3.0": "新增 Cloudflare Tunnel 外网 Emby 302 方案：仓库 tools/guangya-emby302 提供伴侣网关，普通 Emby 页面/API/WebSocket 继续反代，外网 Direct Play 的 /Videos/{Id}/stream 请求读取对应 STRM、通过 MoviePilot GuangYaStrm 换取光鸭 signedURL 后直接向客户端返回 302，使视频主体绕过 Emby 与 Cloudflare Tunnel；明显转码请求自动回退 Emby。",
       "v1.2.0": "新增整理联动与即时操作：可选择“整理完成后自动生成 STRM”，监听 MoviePilot TransferComplete，确认真实整理完成且目标位于光鸭媒体根目录后立即生成单文件 STRM；新增“立即整理”和“立即生成 STRM”按钮/API，手动整理不再要求开启 Cron 自动整理。",
       "v1.1.0": "新增光鸭远端目录自动整理：可配置多个待整理目录与 Cron，递归扫描媒体文件并调用 MoviePilot TransferChain.manual_transfer(background=True)；识别、重命名、目标目录、冲突处理与刮削全部遵循 MoviePilot 原生整理规则，实际云端 move/copy 复用光鸭云盘助手存储适配器。支持保存后立即整理、手动 API 与状态查看。",
       "v1.0.2": "播放链路改为真正 302 直链：MoviePilot 只校验 STRM 签名、向光鸭 API 换取短期 signedURL 并返回 302；媒体主体由 Emby 直接读取光鸭/CDN，不再经过 MoviePilot 流式代理。HEAD 探测直接用远端元数据响应。",
