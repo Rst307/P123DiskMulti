@@ -346,6 +346,21 @@ class GuangYaStrm(_PluginBase):
         finally:
             self._sync_lock.release()
 
+    def start_sync(self) -> Dict[str, Any]:
+        """立即在后台执行一次全量 STRM 同步。"""
+        if self._sync_lock.locked():
+            return {"success": False, "message": "已有 STRM 同步任务正在运行"}
+        threading.Thread(
+            target=self.sync,
+            daemon=True,
+            name="GuangYaStrmSyncNow",
+        ).start()
+        return {
+            "success": True,
+            "background": True,
+            "message": "已开始后台扫描媒体目录并生成 STRM",
+        }
+
     def _run_once(self):
         result = self.sync()
         self._onlyonce = False
@@ -496,9 +511,7 @@ class GuangYaStrm(_PluginBase):
             self._organize_lock.release()
 
     def start_organize(self) -> Dict[str, Any]:
-        """后台启动一次远端目录整理扫描，非重入。"""
-        if not self._organize_enabled:
-            return {"success": False, "message": "自动整理未启用"}
+        """立即后台整理一次；手动执行不要求开启 Cron 自动整理。"""
         if not self._organize_path_list():
             return {"success": False, "message": "未配置待整理光鸭目录"}
         if not self._organize_lock.acquire(blocking=False):
