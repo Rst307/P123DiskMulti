@@ -31,7 +31,7 @@ class GuangYaStrm(_PluginBase):
     plugin_name = "光鸭 STRM"
     plugin_desc = "无需挂载光鸭云盘，直接扫描远程目录生成 STRM，并复用光鸭插件流式播放。"
     plugin_icon = "Moviepilot_A.png"
-    plugin_version = "1.2.0"
+    plugin_version = "1.3.0"
     plugin_author = "Rst307"
     author_url = "https://github.com/Rst307/P123DiskMulti"
     plugin_config_prefix = "guangyastrm_"
@@ -1012,7 +1012,7 @@ class GuangYaStrm(_PluginBase):
                 "component": "VAlert",
                 "props": {
                     "type": "success", "variant": "tonal",
-                    "text": "v1.2.0 使用 302 直链，并支持整理完成后自动生成 STRM。",
+                    "text": "v1.3.0：MoviePilot 播放端仍为光鸭 302；外网如经 Cloudflare Tunnel，使用仓库 tools/guangya-emby302 伴侣网关可让视频主体直接走光鸭/CDN → 客户端。",
                 },
             },
             {
