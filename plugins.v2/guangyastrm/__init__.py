@@ -545,6 +545,79 @@ class GuangYaStrm(_PluginBase):
             self._organize_onlyonce = False
             self._save_config(onlyonce=False)
 
+    def _is_organize_source(self, fileitem: Any, disk_name: str) -> bool:
+        """判断整理完成事件是否来自本插件配置的待整理目录。"""
+        if not fileitem:
+            return False
+        storage = str(getattr(fileitem, "storage", "") or "")
+        if storage and storage != disk_name:
+            return False
+        try:
+            source_path = PurePosixPath(
+                self._normalize_remote(getattr(fileitem, "path", "") or "")
+            )
+        except ValueError:
+            return False
+        for root_text in self._organize_path_list():
+            try:
+                source_path.relative_to(PurePosixPath(root_text))
+                return True
+            except ValueError:
+                continue
+        return False
+
+    def _generate_target_strm(self, target_item: Any) -> Optional[str]:
+        """为一个已经整理完成的目标文件立即生成 STRM。"""
+        remote_path = self._normalize_remote(getattr(target_item, "path", "") or "")
+        relative = self._relative(remote_path)
+        if relative is None:
+            logger.info("【光鸭 STRM】【整理联动】目标不在媒体根目录内，跳过: %s", remote_path)
+            return None
+        if PurePosixPath(remote_path).suffix.casefold() not in self._extensions():
+            return None
+
+        relative_strm = relative.with_suffix(".strm")
+        target = self._safe_output(relative_strm)
+        state = self._write_text(target, self._stream_url(remote_path))
+        self._last_auto_strm = {
+            "time": datetime.now().astimezone().isoformat(timespec="seconds"),
+            "remote_path": remote_path,
+            "strm_path": str(target),
+            "state": state,
+        }
+        logger.info("【光鸭 STRM】【整理联动】STRM %s: %s", state, target)
+        return str(target)
+
+    @eventmanager.register(EventType.TransferComplete)
+    def organize_transfer_complete(self, event: Event):
+        """MoviePilot 真正完成整理后，按需立即生成该目标文件的 STRM。"""
+        if not self._organize_auto_strm:
+            return
+        data = event.event_data or {}
+        if not isinstance(data, dict):
+            return
+
+        plugin, _ = self._source_plugin()
+        if not plugin:
+            return
+        disk_name = str(getattr(plugin, "_disk_name", "") or "光鸭云盘助手")
+
+        source_item = data.get("fileitem")
+        if not self._is_organize_source(source_item, disk_name):
+            return
+
+        transferinfo = data.get("transferinfo")
+        target_item = getattr(transferinfo, "target_item", None)
+        if not target_item:
+            return
+        if str(getattr(target_item, "storage", "") or "") != disk_name:
+            return
+
+        try:
+            self._generate_target_strm(target_item)
+        except Exception as exc:
+            logger.error("【光鸭 STRM】【整理联动】自动生成 STRM 失败: %s", exc)
+
     def play(self, request: Request, path: str = "", sig: str = "") -> Response:
         """
         播放入口只负责鉴权、换取一次性光鸭签名地址并 302 跳转。
