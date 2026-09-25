@@ -579,6 +579,16 @@ class GuangYaStrm(_PluginBase):
         relative_strm = relative.with_suffix(".strm")
         target = self._safe_output(relative_strm)
         state = self._write_text(target, self._stream_url(remote_path))
+
+        # 把联动生成的文件加入索引；若此时正有全量同步，索引由全量同步统一落盘。
+        if self._sync_lock.acquire(blocking=False):
+            try:
+                index = self._load_index()
+                index[remote_path] = relative_strm.as_posix()
+                self._write_index(index)
+            finally:
+                self._sync_lock.release()
+
         self._last_auto_strm = {
             "time": datetime.now().astimezone().isoformat(timespec="seconds"),
             "remote_path": remote_path,
