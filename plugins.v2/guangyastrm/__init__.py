@@ -901,6 +901,15 @@ class GuangYaStrm(_PluginBase):
                         },
                     },
                     {"component": "VSwitch", "props": {"model": "organize_skip_bluray", "label": "跳过 BDMV/CERTIFICATE 原盘结构目录"}},
+                    {
+                        "component": "VSwitch",
+                        "props": {
+                            "model": "organize_auto_strm",
+                            "label": "整理完成后自动生成 STRM",
+                            "hint": "MoviePilot 真正完成整理后，立即为目标文件生成 STRM，不必等下一次全量同步。",
+                            "persistentHint": True,
+                        },
+                    },
                 ],
             }
         ], {
@@ -919,6 +928,7 @@ class GuangYaStrm(_PluginBase):
             "organize_paths": "",
             "organize_cron": "*/10 * * * *",
             "organize_skip_bluray": True,
+            "organize_auto_strm": True,
         }
 
     def get_page(self) -> List[dict]:
@@ -938,7 +948,8 @@ class GuangYaStrm(_PluginBase):
         organize_text = (
             f"自动整理：{'运行中' if organize.get('running') else ('已启用' if organize.get('enabled') else '未启用')}\n"
             f"待整理目录：{', '.join(organize.get('paths') or []) or '未配置'}\n"
-            f"最近执行：{organize.get('last_time') or '尚未执行'}"
+            f"最近执行：{organize.get('last_time') or '尚未执行'}\n"
+            f"整理完成自动 STRM：{'开启' if self._organize_auto_strm else '关闭'}"
         )
         if organize_last:
             organize_text += (
@@ -947,13 +958,51 @@ class GuangYaStrm(_PluginBase):
                 f"失败：{organize_last.get('failed', 0)}"
             )
 
+        actions = {
+            "component": "div",
+            "props": {"class": "d-flex flex-wrap ga-2 mb-3"},
+            "content": [
+                {
+                    "component": "VBtn",
+                    "props": {
+                        "color": "primary",
+                        "variant": "tonal",
+                        "prepend-icon": "mdi-folder-cog",
+                    },
+                    "text": "立即整理",
+                    "events": {
+                        "click": {
+                            "api": f"plugin/{self.__class__.__name__}/action/organize",
+                            "method": "get",
+                        }
+                    },
+                },
+                {
+                    "component": "VBtn",
+                    "props": {
+                        "color": "success",
+                        "variant": "tonal",
+                        "prepend-icon": "mdi-file-link",
+                    },
+                    "text": "立即生成 STRM",
+                    "events": {
+                        "click": {
+                            "api": f"plugin/{self.__class__.__name__}/action/sync",
+                            "method": "get",
+                        }
+                    },
+                },
+            ],
+        }
+
         return [
+            actions,
             {"component": "VAlert", "props": {"type": alert_type, "variant": "tonal", "text": text}},
             {
                 "component": "VAlert",
                 "props": {
                     "type": "success", "variant": "tonal",
-                    "text": "v1.1.0 使用 302 直链：MoviePilot 只处理换链请求，视频主体直接走光鸭/CDN。",
+                    "text": "v1.2.0 使用 302 直链，并支持整理完成后自动生成 STRM。",
                 },
             },
             {
