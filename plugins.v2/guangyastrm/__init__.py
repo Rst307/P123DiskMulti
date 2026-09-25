@@ -699,6 +699,8 @@ class GuangYaStrm(_PluginBase):
             "source_ready": plugin is not None,
             "source_error": error,
             "base_url_configured": bool(self._base_url),
+            "organize_auto_strm": self._organize_auto_strm,
+            "last_auto_strm": self._last_auto_strm,
         }
 
     def get_state(self) -> bool:
@@ -745,6 +747,20 @@ class GuangYaStrm(_PluginBase):
                 "auth": "bear",
                 "summary": "查看自动整理状态",
             },
+            {
+                "path": "/action/sync",
+                "endpoint": self.start_sync,
+                "methods": ["GET"],
+                "auth": "bear",
+                "summary": "立即后台生成 STRM",
+            },
+            {
+                "path": "/action/organize",
+                "endpoint": self.start_organize,
+                "methods": ["GET"],
+                "auth": "bear",
+                "summary": "立即后台整理",
+            },
         ]
 
     def get_service(self) -> List[Dict[str, Any]]:
@@ -784,7 +800,7 @@ class GuangYaStrm(_PluginBase):
                     exc,
                 )
 
-        if self._organize_enabled and self._organize_onlyonce:
+        if self._organize_onlyonce:
             services.append({
                 "id": f"{instance_id}.OrganizeRunOnce",
                 "name": "光鸭云盘立即整理",
