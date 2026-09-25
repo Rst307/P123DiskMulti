@@ -1,0 +1,37 @@
+services:
+  guangya-emby302:
+    build: .
+    container_name: guangya-emby302
+    restart: unless-stopped
+    ports:
+      - "8091:8091"
+    environment:
+      # 如果 Emby / MoviePilot 已映射到宿主机端口，这个写法最通用。
+      EMBY_ORIGIN: "http://host.docker.internal:8096"
+      MOVIEPILOT_ORIGIN: "http://host.docker.internal:3000"
+
+      # Emby API 常见前缀；服务也会自动再尝试无 /emby 前缀。
+      EMBY_API_PREFIX: "/emby"
+
+      # Emby 数据库中 STRM 路径的根，与下面容器挂载根对应。
+      EMBY_STRM_PREFIX: "/strm"
+      LOCAL_STRM_PREFIX: "/strm"
+
+      # 只对经过 Cloudflare 的请求 302；局域网直连保持 Emby 原行为。
+      ONLY_CF: "true"
+
+      # HTTPS Emby 页面默认只跳 HTTPS 网盘直链，避免浏览器 mixed-content。
+      ALLOW_HTTP_DIRECT: "false"
+
+      # signedURL 的极短缓存，降低连续请求时换链次数。
+      DIRECT_CACHE_TTL: "15"
+
+      # 某些客户端不带 static=true 时仍可直放；如要极保守可改 true。
+      REQUIRE_STATIC: "false"
+
+      LOG_LEVEL: "INFO"
+    volumes:
+      # 改成你宿主机真实的 STRM 根目录。
+      - "${STRM_HOST_PATH:-/opt/emby/strm}:/strm:ro"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
