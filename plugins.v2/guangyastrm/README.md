@@ -101,3 +101,70 @@ v1.0.2 已切换为 302 直链。
 - 不需要 WebDAV mount
 - MoviePilot 只承担很小的 API/换链流量
 - 视频主体流量走光鸭/CDN → Emby
+
+
+## 自动整理（v1.1.0）
+
+本插件现在可以像“123云盘多盘合并”的目录整理一样，直接扫描光鸭远端目录并提交到 MoviePilot 原生整理链。
+
+推荐与你当前的目录结构这样配：
+
+```text
+待整理目录（源）：
+光鸭云盘助手:/emby_raw
+
+MoviePilot 媒体库/整理目标：
+光鸭云盘助手:/emby
+```
+
+插件配置：
+
+```text
+启用光鸭云盘自动整理：开启
+待整理光鸭目录：
+/emby_raw
+
+自动整理 Cron：
+*/10 * * * *
+```
+
+工作流：
+
+```text
+光鸭 /emby_raw
+      ↓ 递归扫描视频
+GuangYaStrm
+      ↓ TransferChain.manual_transfer(background=True)
+MoviePilot 原生识别/命名/整理规则
+      ↓
+光鸭云盘助手 StorageOperSelection
+      ↓ 云端 move/copy
+光鸭 /emby
+      ↓
+STRM 同步
+      ↓
+Emby
+```
+
+需要注意：**“待整理目录”只负责指定源文件在哪里，最终整理到哪里由 MoviePilot 自己的整理/存储目录设置决定。** 因此请先在 MoviePilot 中把媒体库目标配置成“光鸭云盘助手”的 `/emby`。
+
+自动整理具备：
+
+- 多个源目录（每行一个）
+- Cron 周期扫描
+- 保存后立即执行一次
+- 后台非重入，避免同时跑两轮
+- 递归扫描视频文件
+- 可跳过 BDMV / CERTIFICATE 原盘结构
+- 调用 MoviePilot 原生整理链，不自己实现识别和命名规则
+- 已成功移动出源目录的文件下次扫描不会再出现
+- `/organize/status` 可查看最近扫描/提交/失败数量
+
+手动 API：
+
+```text
+POST /api/v1/plugin/GuangYaStrm/organize/run
+GET  /api/v1/plugin/GuangYaStrm/organize/status
+```
+
+这两个管理接口需要 MoviePilot Bearer 登录认证。
